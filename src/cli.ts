@@ -1,0 +1,822 @@
+import * as fs from "node:fs"
+import * as path from "node:path"
+import { fileURLToPath } from "node:url"
+import { parseArgs } from "node:util"
+import { expandBpms, parseFixture, FixtureNote, ParsedFixture } from "./dsl"
+import { FIXTURES } from "./fixtures/index"
+import { availableParallelism } from "node:os"
+import {
+  runEngine,
+  checkMirror,
+  checkUDMirror,
+  checkLRUDMirror,
+  MirrorCheck,
+} from "./engine"
+import { evaluateFixture } from "./evaluate"
+import { generateSong, GEN_DIR } from "./sscgen"
+import { loadSSC, writeGolden } from "./ssc"
+import { compareAnnotated, printComparison } from "./compare"
+import {
+  scaleTempo,
+  chartMirrorChecks,
+  analyzeChart,
+  ChartResult,
+} from "./chartCompute"
+import { runChartPool } from "./chartPool"
+
+// Single source of truth for flags: parseArgs config and --help output are
+// both derived from this table. Add a flag here and it's parsed, validated,
+// and documented.
+interface OptSpec {
+  type: "boolean" | "string"
+  short?: string
+  arg?: string // value placeholder shown in help, e.g. "<file.ssc>"
+  desc: string
+  group: keyof typeof GROUPS
+}
+
+const GROUPS = {
+  fixture:
+    "Fixture suite — positional args filter by substring match on fixture\nname (a filter implies --fixtures):",
+  chart:
+    "Chart sweep — compare the engine's natural output against a real chart's\nhuman annotations (#PARITYGOLDEN baked target and/or #PARITY / data.sme\nsparse overrides):",
+  general: "General:",
+} as const
+
+const OPTIONS: Record<string, OptSpec> = {
+  fixtures: {
+    type: "boolean",
+    desc: "run only the fixture suite (skip the chart sweep); combine with --chart to run both explicitly",
+    group: "fixture",
+  },
+  verbose: {
+    type: "boolean",
+    short: "v",
+    desc: "per-row tables for passing fixtures too",
+    group: "fixture",
+  },
+  explain: {
+    type: "boolean",
+    desc: "for failing fixtures: force expected feet as overrides and report per-category cost deltas; for mirror-asymmetric fixtures: print the per-row mismatches",
+    group: "fixture",
+  },
+  "no-mirror": {
+    type: "boolean",
+    desc: "skip mirror-invariance checks",
+    group: "fixture",
+  },
+  gen: {
+    type: "boolean",
+    desc: `write openable .ssc charts to ${GEN_DIR}/ under the package root`,
+    group: "fixture",
+  },
+  chart: {
+    type: "string",
+    arg: "[path]",
+    desc: "chart to compare, or a directory to sweep every .ssc under it (one summary line per chart; -v for full divergence output). With no argument, sweeps the bundled reference-charts corpus",
+    group: "chart",
+  },
+  difficulty: {
+    type: "string",
+    arg: "<name>",
+    desc: "pick a chart by difficulty (default: first in file)",
+    group: "chart",
+  },
+  "write-golden": {
+    type: "boolean",
+    desc: "bake #PARITYGOLDEN from the annotation-guided run",
+    group: "chart",
+  },
+  "bpm-factor": {
+    type: "string",
+    arg: "<f>",
+    desc: "scale every tempo by this factor. Incompatible with --write-golden",
+    group: "general",
+  },
+  jobs: {
+    type: "string",
+    short: "j",
+    arg: "<n>",
+    desc: "parallel workers for a directory chart sweep (default: CPU count, 1: no workers)",
+    group: "general",
+  },
+  help: { type: "boolean", short: "h", desc: "show this help", group: "general" },
+}
+
+function usage(): string {
+  const flagCol = (name: string, o: OptSpec) =>
+    "  " +
+    [o.short ? `-${o.short},` : undefined, `--${name}`, o.arg]
+      .filter(Boolean)
+      .join(" ")
+  const width =
+    Math.max(...Object.entries(OPTIONS).map(([n, o]) => flagCol(n, o).length)) + 2
+  const lines = [
+    "usage: parity [filter...] [options]",
+    "",
+    "With no mode selection (no --fixtures, --chart, or filter), the fixture",
+    "suite and the reference-charts sweep both run in one invocation.",
+  ]
+  for (const [group, header] of Object.entries(GROUPS)) {
+    lines.push("", header)
+    for (const [name, o] of Object.entries(OPTIONS)) {
+      if (o.group !== group) continue
+      let col = flagCol(name, o).padEnd(width)
+      for (const word of o.desc.split(" ")) {
+        if (col.length + word.length > 78) {
+          lines.push(col.trimEnd())
+          col = " ".repeat(width)
+        }
+        col += word + " "
+      }
+      lines.push(col.trimEnd())
+    }
+  }
+  return lines.join("\n")
+}
+
+// --chart with no argument defaults to the bundled reference-charts corpus.
+// parseArgs has no notion of an optional-argument option, so patch the default
+// value in when --chart is bare (last token, or followed by another flag).
+// Resolve it against the package root so it works from any cwd (parity.sh runs
+// tsx from wherever it was invoked).
+const REFERENCE_CHARTS = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "reference-charts"
+)
+const rawArgs = process.argv.slice(2)
+const patchedArgs: string[] = []
+for (let i = 0; i < rawArgs.length; i++) {
+  patchedArgs.push(rawArgs[i])
+  if (rawArgs[i] === "--chart") {
+    const next = rawArgs[i + 1]
+    if (next === undefined || next.startsWith("-")) patchedArgs.push(REFERENCE_CHARTS)
+  }
+}
+
+let values: Record<string, string | boolean | undefined>
+let filters: string[]
+try {
+  const parsed = parseArgs({
+    args: patchedArgs,
+    options: Object.fromEntries(
+      Object.entries(OPTIONS).map(([name, o]) => [
+        name,
+        { type: o.type, ...(o.short ? { short: o.short } : {}) },
+      ])
+    ),
+    allowPositionals: true,
+  })
+  values = parsed.values
+  filters = parsed.positionals
+} catch (err) {
+  console.error(`${(err as Error).message}\n\n${usage()}`)
+  process.exit(2)
+}
+if (values.help) {
+  console.log(usage())
+  process.exit(0)
+}
+
+const doGen = values.gen === true
+const verbose = values.verbose === true
+const noMirror = values["no-mirror"] === true
+const explain = values.explain === true
+const chartPath = values.chart as string | undefined
+const bpmFactor =
+  values["bpm-factor"] === undefined
+    ? 1
+    : parseFloat(values["bpm-factor"] as string)
+if (!Number.isFinite(bpmFactor) || bpmFactor <= 0) {
+  console.error(`invalid --bpm-factor: ${values["bpm-factor"]}`)
+  process.exit(2)
+}
+
+const jobs =
+  values.jobs === undefined
+    ? Math.max(1, availableParallelism() - 1)
+    : parseInt(values.jobs as string, 10)
+if (!Number.isInteger(jobs) || jobs < 1) {
+  console.error(`invalid --jobs: ${values.jobs}`)
+  process.exit(2)
+}
+
+const RED = "\x1b[31m"
+const GREEN = "\x1b[32m"
+const YELLOW = "\x1b[33m"
+const CYAN = "\x1b[36m"
+const DIM = "\x1b[2m"
+const RESET = "\x1b[0m"
+
+function fmtExpectation(exp: {
+  expectedTechs: string[]
+  skip: boolean
+}): string {
+  if (exp.skip) return "*"
+  return exp.expectedTechs.join(" ")
+}
+
+function fmtFeet(feet: (string | null | undefined)[]): string {
+  return [0, 1, 2, 3]
+    .map(c => (feet[c] === undefined ? "." : feet[c] === null ? "?" : feet[c]))
+    .join("")
+}
+
+// -------------------------------------------------------------- chart sweep
+// Compare the engine's natural interpretation of a real chart against its
+// manual #PARITY annotations, and explain divergences in cost terms.
+// A directory sweeps every .ssc under it with one summary line per chart.
+
+// Which suites run: an explicit --fixtures or --chart selects that suite, a
+// positional filter implies --fixtures (it targets fixtures by name), and a
+// bare invocation runs both — fixtures plus the reference-charts sweep.
+const wantFixtures =
+  values.fixtures === true || filters.length > 0 || chartPath === undefined
+const wantCharts =
+  chartPath !== undefined || (values.fixtures !== true && filters.length === 0)
+const chartTarget = chartPath ?? (wantCharts ? REFERENCE_CHARTS : undefined)
+
+if (chartTarget !== undefined && !fs.existsSync(chartTarget)) {
+  console.error(`no such file or directory: ${chartTarget}`)
+  process.exit(2)
+}
+const chartIsDir =
+  chartTarget !== undefined && fs.statSync(chartTarget).isDirectory()
+if (chartIsDir && values["write-golden"]) {
+  console.error("--write-golden needs a single .ssc file, not a directory")
+  process.exit(2)
+}
+
+async function runChartSweep(sweepDir: string): Promise<number> {
+  const files = (fs.readdirSync(sweepDir, { recursive: true }) as string[])
+    .filter(f => f.endsWith(".ssc"))
+    .sort()
+    .map(f => path.join(sweepDir, f))
+  if (files.length === 0) {
+    console.error(`no .ssc files under ${sweepDir}`)
+    return 2
+  }
+  let agree = 0
+  let diverged = 0
+  let skipped = 0
+  let errors = 0
+  let mirrorAsymmetric = 0
+  let segmentCount = 0
+  const totalNatural: Record<string, number> = {}
+  const totalAnnotated: Record<string, number> = {}
+
+  // Format one chart's result and fold it into the running totals. Called as
+  // each result arrives (in file order inline, in completion order from the
+  // pool) so charts print live rather than all at the end; the summary totals
+  // are order-independent sums, so streaming doesn't change them.
+  const renderResult = (res: ChartResult) => {
+    if (verbose && res.kind !== "error") {
+      for (const w of res.warnings) console.log(`${YELLOW}warning: ${w}${RESET}`)
+    }
+    if (res.kind === "error") {
+      errors++
+      console.log(`${RED}ERROR${RESET}  ${res.file}: ${res.message}`)
+      return
+    }
+    const name = `${res.title} [${res.difficulty}]`.padEnd(46)
+    if (res.kind === "skip") {
+      skipped++
+      console.log(
+        `${DIM}SKIP   ${name} ${"—".padStart(9)}  no annotations${RESET}`
+      )
+      return
+    }
+    const { cmp, asym } = res
+    const delta = cmp.annotated.bestPathCost - cmp.natural.bestPathCost
+    const deltaStr = `${delta >= 0 ? "+" : ""}${delta.toFixed(2)}`
+    let mirrorTag = ""
+    if (asym.length > 0) {
+      mirrorAsymmetric++
+      mirrorTag = asym
+        .map(([label]) => `  ${YELLOW}${label}-asymmetric${RESET}`)
+        .join("")
+    }
+    if (cmp.identical) {
+      agree++
+      // for a passing chart the interesting cost is the margin to the
+      // engine's next-best interpretation: how comfortably it passes
+      const margin = cmp.natural.nextBestDelta
+      const marginStr =
+        margin === undefined ? "—" : `+${Math.max(0, margin).toFixed(2)}`
+      console.log(
+        `${GREEN}PASS${RESET}   ${name} ${marginStr.padStart(9)}  ${DIM}to next-best${RESET}${mirrorTag}`
+      )
+    } else {
+      diverged++
+      segmentCount += cmp.segments.length
+      for (const seg of cmp.segments) {
+        for (const [cat, v] of Object.entries(seg.naturalCosts))
+          totalNatural[cat] = (totalNatural[cat] ?? 0) + v
+        for (const [cat, v] of Object.entries(seg.annotatedCosts))
+          totalAnnotated[cat] = (totalAnnotated[cat] ?? 0) + v
+      }
+      console.log(
+        `${RED}DIFF${RESET}   ${name} ${deltaStr.padStart(9)}  ${DIM}to golden, ` +
+          `${cmp.segments.length} divergent segment${cmp.segments.length === 1 ? "" : "s"}${RESET}${mirrorTag}`
+      )
+      if (verbose) printComparison(cmp, s => console.log("   " + s))
+    }
+    if (verbose) {
+      for (const [label, c] of asym) {
+        for (const d of c.violations.slice(0, 8)) {
+          console.log(`   ${YELLOW}${label}: ${d}${RESET}`)
+        }
+        if (c.violations.length > 8) {
+          console.log(`   ${DIM}… ${c.violations.length - 8} more${RESET}`)
+        }
+      }
+    }
+  }
+
+  // Each chart is independent and the engine is stateless per run, so the
+  // heavy per-file work (compareAnnotated + three mirror checks, each running
+  // the engine) fans out across a worker pool, printing each chart as its
+  // worker finishes. `-j1` skips the workers and runs inline in file order
+  // (useful for profiling, debugging, and deterministic output).
+  const job = {
+    difficulty: values.difficulty as string | undefined,
+    bpmFactor,
+    noMirror,
+  }
+  if (jobs <= 1) {
+    for (const file of files) renderResult(analyzeChart(file, job))
+  } else {
+    await runChartPool(files, job, jobs, renderResult)
+  }
+
+  console.log("─".repeat(60))
+  console.log(
+    `${agree}/${agree + diverged} annotated charts agree` +
+      (diverged ? `, ${RED}${diverged} diverge${RESET}` : "") +
+      (noMirror
+        ? ""
+        : mirrorAsymmetric
+          ? `, ${YELLOW}${mirrorAsymmetric} mirror-asymmetric${RESET}`
+          : ", mirror invariance holds") +
+      (skipped ? `, ${skipped} unannotated skipped` : "") +
+      (errors ? `, ${RED}${errors} errors${RESET}` : "")
+  )
+  if (diverged) {
+    // same category-delta accounting printComparison does per segment,
+    // summed over every divergent segment in the sweep
+    const cats = new Set([
+      ...Object.keys(totalNatural),
+      ...Object.keys(totalAnnotated),
+    ])
+    cats.delete("TOTAL")
+    const deltas = [...cats]
+      .map(cat => ({
+        cat,
+        natural: totalNatural[cat] ?? 0,
+        annotated: totalAnnotated[cat] ?? 0,
+      }))
+      .map(d => ({ ...d, delta: d.annotated - d.natural }))
+      .filter(d => Math.abs(d.delta) > 0.005)
+      .sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta))
+    console.log(
+      `cost-category deltas summed over all ${segmentCount} divergent segments ` +
+        `${DIM}(+ = the human path pays more there; the engine chased the negatives)${RESET}`
+    )
+    for (const d of deltas) {
+      const sign = d.delta > 0 ? RED + "+" : GREEN + ""
+      console.log(
+        `   ${d.cat.padEnd(18)} ${sign}${d.delta.toFixed(2)}${RESET}` +
+          `  ${DIM}(natural ${d.natural.toFixed(2)}, annotated ${d.annotated.toFixed(2)})${RESET}`
+      )
+    }
+  }
+  return diverged + errors + mirrorAsymmetric > 0 ? 1 : 0
+}
+
+function runSingleChart(chartFile: string): number {
+  const chart = loadSSC(chartFile, {
+    difficulty: values.difficulty as string | undefined,
+  })
+  console.log(
+    `${chart.title} [${chart.difficulty}] — ${chart.notes.length} notes, ` +
+      (chart.goldenCount
+        ? `${chart.goldenCount} golden feet (#PARITYGOLDEN)` +
+          (chart.overrideCount
+            ? ` + ${chart.overrideCount} newer overrides overlaid`
+            : "")
+        : `${chart.overrideCount} manual foot annotations`)
+  )
+  for (const w of chart.warnings) console.log(`${YELLOW}warning: ${w}${RESET}`)
+
+  if (values["write-golden"]) {
+    if (bpmFactor !== 1) {
+      // golden feet must be ground truth at the chart's real tempo
+      console.error("--write-golden cannot be combined with --bpm-factor")
+      return 2
+    }
+    // Snapshot #PARITYGOLDEN from the ANNOTATION-GUIDED run when overrides
+    // exist (the engine constrained by the human marks — golden becomes the
+    // target, and the remaining engine work is making the natural output
+    // match it). Falls back to the natural run on unannotated charts, which
+    // should only be done when the interpretation has been verified.
+    const hasAnnotations = chart.goldenCount + chart.overrideCount > 0
+    const run = runEngine(chart.notes, chart.lastBeat)
+    const count = writeGolden(chartFile, chart.notes, run.labels)
+    console.log(
+      `${GREEN}wrote #PARITYGOLDEN for ${count} notes from the ` +
+        `${hasAnnotations ? "annotation-guided" : "natural"} run${RESET}`
+    )
+    if (hasAnnotations) {
+      console.log(
+        `${DIM}review unannotated regions in SMEditor before treating this as fully golden${RESET}`
+      )
+    }
+    return 0
+  }
+
+  if (chart.goldenCount === 0 && chart.overrideCount === 0) {
+    console.log(
+      "chart has no #PARITYGOLDEN or #PARITY overrides; annotate feet in SMEditor (parity edit mode) and save as .ssc"
+    )
+    return 2
+  }
+  const scaledNotes = scaleTempo(chart.notes, bpmFactor)
+  if (bpmFactor !== 1) console.log(`${DIM}bpm ×${bpmFactor}${RESET}`)
+  const cmp = compareAnnotated(scaledNotes, chart.lastBeat)
+  printComparison(cmp)
+  if (cmp.identical && cmp.natural.nextBestDelta !== undefined) {
+    console.log(
+      `${DIM}next-best interpretation costs +${Math.max(0, cmp.natural.nextBestDelta).toFixed(2)}${RESET}`
+    )
+  }
+  let mirrorsOk = true
+  if (!noMirror) {
+    const bad = chartMirrorChecks(
+      scaledNotes,
+      chart.lastBeat,
+      cmp.natural
+    ).filter(([, c]) => !c.ok)
+    mirrorsOk = bad.length === 0
+    if (mirrorsOk) {
+      console.log(`${DIM}mirror invariance holds (lr, ud, lrud)${RESET}`)
+    }
+    for (const [label, c] of bad) {
+      console.log(
+        `${YELLOW}${label}-asymmetric — ${c.violations.length} violation${c.violations.length === 1 ? "" : "s"}:${RESET}`
+      )
+      for (const d of c.violations.slice(0, verbose ? Infinity : 8)) {
+        console.log(`   ${YELLOW}${d}${RESET}`)
+      }
+      if (!verbose && c.violations.length > 8) {
+        console.log(`   ${DIM}… ${c.violations.length - 8} more (-v for all)${RESET}`)
+      }
+    }
+  }
+  return cmp.identical && mirrorsOk ? 0 : 1
+}
+
+// Force a fixture's expected feet as parity overrides, so the comparison
+// explains WHY the engine deviates from the fixture's ground truth.
+function explainFixture(parsed: ParsedFixture) {
+  const overridden: FixtureNote[] = parsed.notedata.map(n => ({ ...n }))
+  let count = 0
+  for (const row of parsed.rows) {
+    if (row.skip) continue
+    for (let col = 0; col < 4; col++) {
+      const want = row.feet[col]
+      if (want !== "L" && want !== "R") continue
+      const note = overridden.find(
+        n => Math.abs(n.beat - row.beat) < 1e-6 && n.col === col
+      )
+      if (note) {
+        note.parity = { override: want === "L" ? "Left" : "Right" }
+        count++
+      }
+    }
+  }
+  if (count === 0) {
+    console.log(`   ${DIM}no expected feet to force${RESET}`)
+    return
+  }
+  const cmp = compareAnnotated(overridden, parsed.lastBeat)
+  printComparison(cmp, s => console.log("   " + s))
+}
+
+// Per-row table of a failing mirror run: the base run mapped into mirrored
+// columns (what invariance predicts) against what the engine actually chose.
+function printMirrorRun(name: string, check: MirrorCheck) {
+  console.log(
+    `   ${YELLOW}${name} run — feet:exp is the base run mirrored:${RESET}`
+  )
+  console.log(
+    `   ${DIM}${"row".padEnd(4)} ${"beat".padEnd(7)} ${"feet:exp".padEnd(9)} ${"feet:act".padEnd(9)} ${"tech:base".padEnd(11)} ${"tech:mir".padEnd(11)} ${"cost:base→mir".padEnd(15)} err:base→mir${RESET}`
+  )
+  for (const r of check.rows) {
+    const mark = r.ok ? `${DIM}·${RESET}` : `${RED}✗${RESET}`
+    const costEqual = Math.abs(r.baseCost - r.mirroredCost) <= 0.005
+    const cost = costEqual
+      ? `${DIM}${r.baseCost.toFixed(2)}${RESET}${" ".repeat(Math.max(0, 15 - r.baseCost.toFixed(2).length))}`
+      : `${RED}${`${r.baseCost.toFixed(2)}→${r.mirroredCost.toFixed(2)}`.padEnd(15)}${RESET}`
+    const errs =
+      r.baseErrors.length || r.mirroredErrors.length
+        ? `${r.baseErrors.join(" ") || "-"}→${r.mirroredErrors.join(" ") || "-"}`
+        : ""
+    console.log(
+      ` ${mark} ${String(r.row).padEnd(4)} ${r.beat.toFixed(2).padEnd(7)} ` +
+        `${r.expectedFeet.padEnd(9)} ${r.actualFeet.padEnd(9)} ` +
+        `${r.baseTechs.join(" ").padEnd(11)} ${r.mirroredTechs.join(" ").padEnd(11)} ` +
+        `${cost} ${errs}`
+    )
+    for (const d of r.costDiffs) {
+      console.log(`     ${RED}${d}${RESET}`)
+    }
+  }
+}
+
+// ------------------------------------------------------------ fixture suite
+
+function runFixtures(): number {
+  const selected = FIXTURES.filter(
+    f =>
+      filters.length === 0 ||
+      filters.some(q => f.name.includes(q))
+  )
+
+  if (selected.length === 0) {
+    console.error(`No fixtures match: ${filters.join(", ")}`)
+    return 2
+  }
+
+  let failures = 0
+  let mirrorFailures = 0
+  let udAsymmetries = 0
+  let lrudAsymmetries = 0
+  const summary: string[] = []
+
+  // Per-fixture output is buffered and printed grouped by result:
+  // passes first, then known issues, then partials, then failures/errors.
+  const SECTIONS = ["PASS", "KNOWN", "PARTIAL", "FAIL"] as const
+  type Section = (typeof SECTIONS)[number]
+  const SECTION_LABELS: Record<Section, string> = {
+    PASS: "passes",
+    KNOWN: "known issues",
+    PARTIAL: "partial",
+    FAIL: "failures",
+  }
+  const grouped: Record<Section, string[]> = {
+    PASS: [],
+    KNOWN: [],
+    PARTIAL: [],
+    FAIL: [],
+  }
+
+  for (const fixture of selected) {
+    let line: string
+    let section: Section = "FAIL"
+    const buffer: string[] = []
+    const realLog = console.log
+    console.log = (...args: unknown[]) => {
+      buffer.push(args.map(String).join(" "))
+    }
+    try {
+      // A multi-bpm fixture runs once per tempo but reports as a single entry;
+      // the status line notes the tempo(s) that fail.
+      const variants = expandBpms(fixture, bpmFactor)
+      const multi = variants.length > 1
+
+      if (doGen) {
+        const songsRoot = path.join(
+          path.dirname(fileURLToPath(import.meta.url)),
+          ".."
+        )
+        // one song per fixture, generated at the defined (first) tempo
+        const dir = generateSong(parseFixture(variants[0]), songsRoot)
+        console.log(`${DIM}wrote${RESET} ${dir}`)
+      }
+
+      const skipped: MirrorCheck = { ok: true, violations: [], tieBreaks: [], rows: [] }
+      const results = variants.map(variant => {
+        const parsed = parseFixture(variant)
+        const run = runEngine(parsed.notedata, parsed.lastBeat)
+        const report = evaluateFixture(parsed, run)
+        const mirror = noMirror ? skipped : checkMirror(parsed, run)
+        // Front/back (D<->U) invariance is expected to hold at foot granularity
+        // just like L/R — part-level heel/toe assignments necessarily flip.
+        const udMirror = noMirror ? skipped : checkUDMirror(parsed, run)
+        const lrudMirror = noMirror ? skipped : checkLRUDMirror(parsed, run)
+        return {
+          bpm: variant.bpm,
+          parsed,
+          run,
+          report,
+          mirror,
+          udMirror,
+          lrudMirror,
+          pass: report.problems === 0,
+          symmetric: mirror.ok && udMirror.ok && lrudMirror.ok,
+        }
+      })
+
+      const pass = results.every(r => r.pass)
+      const symmetric = results.every(r => r.symmetric)
+      // feet fully correct but something secondary is off — tech-notation
+      // expectations or a mirror invariant — reported as PARTIAL
+      const notationOnly = !pass && results.every(r => r.report.footProblems === 0)
+      const partial = notationOnly || (pass && !symmetric)
+      const failedBpms = results
+        .filter(r => !r.pass)
+        .map(r => r.bpm)
+        .sort((a, b) => a - b)
+      // note failing tempos only when tempo actually discriminates: a fixture
+      // that fails at every bpm carries no bpm tag
+      const bpmTag =
+        multi && failedBpms.length > 0 && failedBpms.length < results.length
+          ? `  ${DIM}@${failedBpms.join(" @")}${RESET}`
+          : ""
+      const asymTag = (label: string, badBpms: number[]) =>
+        badBpms.length === 0
+          ? ""
+          : `  ${YELLOW}${label}${
+              multi && badBpms.length < results.length
+                ? "@" + badBpms.sort((a, b) => a - b).join(",")
+                : ""
+            }${RESET}`
+      const mirrorTag =
+        asymTag("mirror-asymmetric", results.filter(r => !r.mirror.ok).map(r => r.bpm)) +
+        asymTag("ud-mirror-asymmetric", results.filter(r => !r.udMirror.ok).map(r => r.bpm)) +
+        asymTag("lrud-mirror-asymmetric", results.filter(r => !r.lrudMirror.ok).map(r => r.bpm))
+      const known = fixture.knownIssue !== undefined
+      if (!pass && !known) failures++
+      if (results.some(r => !r.mirror.ok)) mirrorFailures++
+      if (results.some(r => !r.udMirror.ok)) udAsymmetries++
+      if (results.some(r => !r.lrudMirror.ok)) lrudAsymmetries++
+
+      let status: string
+      if (known && pass && symmetric) {
+        status = `${YELLOW}FIXED?${RESET}` // passing but marked known-broken: update the fixture
+        section = "KNOWN"
+      } else if (known) {
+        status = `${YELLOW}KNOWN${RESET}`
+        section = "KNOWN"
+      } else if (pass && symmetric) {
+        status = `${GREEN}PASS${RESET}`
+        section = "PASS"
+      } else if (partial) {
+        status = `${CYAN}PARTIAL${RESET}`
+        section = "PARTIAL"
+      } else {
+        status = `${RED}FAIL${RESET}`
+      }
+      line = `${status}  ${fixture.name}${bpmTag}${mirrorTag}`
+      console.log(line)
+      if (known && pass && symmetric) {
+        console.log(
+          `   ${YELLOW}passes despite knownIssue — verify and remove the marker: ${fixture.knownIssue}${RESET}`
+        )
+      } else if (known) {
+        if (!verbose) {
+          console.log(`   ${DIM}${fixture.knownIssue}${RESET}`)
+        }
+      } else if (partial) {
+        const reasons = []
+        const notationProblems = results.reduce(
+          (n, r) => n + r.report.notationProblems,
+          0
+        )
+        if (notationProblems > 0) {
+          reasons.push(
+            `${notationProblems} tech-notation problem${notationProblems === 1 ? "" : "s"}`
+          )
+        }
+        if (!symmetric) reasons.push("mirror asymmetry")
+        console.log(`   ${DIM}feet match; ${reasons.join("; ")}${RESET}`)
+      }
+
+      for (const r of results) {
+        const show =
+          (!r.pass && !known) || verbose || !r.mirror.ok || (explain && !r.symmetric)
+        if (!show) continue
+        if (multi) console.log(`   ${DIM}@${r.bpm}:${RESET}`)
+        if (r.report.error) {
+          console.log(`   ${RED}${r.report.error}${RESET}`)
+        }
+        if (!r.pass || verbose) {
+          console.log(
+            `   ${DIM}${"row".padEnd(4)} ${"beat".padEnd(7)} ${"cols".padEnd(5)} ${"feet:exp".padEnd(9)} ${"feet:act".padEnd(9)} ${"tech:exp".padEnd(10)} ${"tech:act".padEnd(10)} ${"cost".padEnd(8)} err${RESET}`
+          )
+          for (const [i, row] of r.report.rows.entries()) {
+            const exp = row.expectation
+            const mark = row.problems.length ? `${RED}✗${RESET}` : `${DIM}·${RESET}`
+            const cost = r.run.edgeCosts[i]?.["TOTAL"] ?? 0
+            console.log(
+              ` ${mark} ${String(i).padEnd(4)} ${exp.beat.toFixed(2).padEnd(7)} ${exp.chars.padEnd(5)} ` +
+                `${fmtFeet(exp.feet).padEnd(9)} ${fmtFeet(row.actual.feet).padEnd(9)} ` +
+                `${fmtExpectation(exp).padEnd(10)} ${row.actual.techs.join(" ").padEnd(10)} ` +
+                `${cost.toFixed(2).padEnd(8)} ${row.actual.errors.join(" ")}`
+            )
+            for (const p of row.problems) {
+              console.log(`     ${RED}${p}${RESET}`)
+            }
+          }
+        }
+        for (const d of r.mirror.violations.slice(0, 8)) {
+          console.log(`   ${YELLOW}mirror: ${d}${RESET}`)
+        }
+        if (verbose || explain) {
+          for (const d of r.udMirror.violations.slice(0, 8)) {
+            console.log(`   ${YELLOW}ud-mirror: ${d}${RESET}`)
+          }
+          for (const d of r.lrudMirror.violations.slice(0, 8)) {
+            console.log(`   ${YELLOW}lrud-mirror: ${d}${RESET}`)
+          }
+          if (!r.mirror.ok) printMirrorRun("mirror", r.mirror)
+          if (!r.udMirror.ok) printMirrorRun("ud-mirror", r.udMirror)
+          if (!r.lrudMirror.ok) printMirrorRun("lrud-mirror", r.lrudMirror)
+        }
+        if (verbose) {
+          for (const d of r.mirror.tieBreaks.slice(0, 8)) {
+            console.log(`   ${DIM}mirror tie-break: ${d}${RESET}`)
+          }
+        }
+        console.log()
+      }
+      if (explain) {
+        for (const r of results) {
+          if (r.pass) continue
+          if (multi) console.log(`   ${DIM}@${r.bpm}:${RESET}`)
+          explainFixture(r.parsed)
+          console.log()
+        }
+      }
+      summary.push(
+        `${section}${results.some(r => !r.mirror.ok) ? " (mirror!)" : ""}  ${fixture.name}`
+      )
+    } catch (err) {
+      failures++
+      section = "FAIL"
+      console.log(`${RED}ERROR${RESET} ${fixture.name}: ${(err as Error).stack}`)
+      summary.push(`ERROR ${fixture.name}`)
+    } finally {
+      console.log = realLog
+    }
+    grouped[section].push(buffer.join("\n"))
+  }
+
+  if (bpmFactor !== 1) console.log(`${DIM}bpm ×${bpmFactor}${RESET}`)
+  for (const s of SECTIONS) {
+    if (grouped[s].length === 0) continue
+    console.log(`${DIM}${`── ${SECTION_LABELS[s]} `.padEnd(60, "─")}${RESET}`)
+    for (const block of grouped[s]) console.log(block)
+    console.log()
+  }
+
+  console.log("─".repeat(60))
+  const knownCount = summary.filter(s => s.startsWith("KNOWN")).length
+  const partialCount = summary.filter(s => s.startsWith("PARTIAL")).length
+  console.log(
+    `${summary.filter(s => s.startsWith("PASS")).length}/${selected.length} fixtures pass` +
+      (partialCount
+        ? `, ${CYAN}${partialCount} partial (feet ok; notation or symmetry differs)${RESET}`
+        : "") +
+      (knownCount ? `, ${knownCount} known issues` : "") +
+      (failures ? `, ${RED}${failures} unexpected failures${RESET}` : "") +
+      (mirrorFailures
+        ? `, ${YELLOW}${mirrorFailures} mirror-asymmetric${RESET}`
+        : ", mirror invariance holds") +
+      (udAsymmetries
+        ? `, ${YELLOW}${udAsymmetries} ud-mirror-asymmetric${RESET}`
+        : ", ud-mirror invariance holds") +
+      (lrudAsymmetries
+        ? `, ${YELLOW}${lrudAsymmetries} lrud-mirror-asymmetric${RESET}`
+        : ", lrud-mirror invariance holds")
+  )
+  return failures > 0 ? 1 : 0
+}
+
+// --------------------------------------------------------------- dispatcher
+// In a combined run the sweep's worker pool starts before the fixture suite,
+// so chart analysis proceeds on worker threads while the (synchronous)
+// fixture loop occupies the main thread. Pool results only render once the
+// promise is awaited — the fixture loop never yields to the event loop — so
+// chart output always lands after the fixture report. -j1 has no pool; the
+// sweep runs inline after fixtures instead.
+let sweepEarly: Promise<number> | undefined
+if (chartTarget !== undefined && chartIsDir && jobs > 1) {
+  sweepEarly = runChartSweep(chartTarget)
+}
+
+const fixtureCode = wantFixtures ? runFixtures() : 0
+
+let chartCode = 0
+if (chartTarget !== undefined) {
+  if (wantFixtures) {
+    console.log()
+    console.log(`${DIM}${"── charts ".padEnd(60, "─")}${RESET}`)
+  }
+  chartCode = chartIsDir
+    ? await (sweepEarly ?? runChartSweep(chartTarget))
+    : runSingleChart(chartTarget)
+}
+
+process.exit(Math.max(fixtureCode, chartCode))

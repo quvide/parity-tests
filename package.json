@@ -1,0 +1,13 @@
+{
+  "name": "parity-tests",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Headless baseline test suite for SMEditor's parity engine",
+  "devDependencies": {
+    "@esbuild/darwin-arm64": "^0.28.1",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0"
+  }
+}
