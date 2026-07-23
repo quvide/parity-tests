@@ -15,7 +15,7 @@ import {
 import { evaluateFixture } from "./evaluate"
 import { generateSong, GEN_DIR } from "./sscgen"
 import { loadSSC, writeGolden } from "./ssc"
-import { compareAnnotated, printComparison } from "./compare"
+import { compareAnnotated, fmtEdgeSide, printComparison } from "./compare"
 import {
   scaleTempo,
   chartMirrorChecks,
@@ -37,7 +37,7 @@ interface OptSpec {
 
 const GROUPS = {
   fixture:
-    "Fixture suite — positional args filter by substring match on fixture\nname (a filter implies --fixtures):",
+    "Fixture suite — positional args select fixtures by exact name, or by\nglob when the filter contains * or ? (a filter implies --fixtures):",
   chart:
     "Chart sweep — compare the engine's natural output against a real chart's\nhuman annotations (#PARITYGOLDEN baked target and/or #PARITY / data.sme\nsparse overrides):",
   general: "General:",
@@ -52,13 +52,13 @@ const OPTIONS: Record<string, OptSpec> = {
   verbose: {
     type: "boolean",
     short: "v",
-    desc: "per-row tables for passing fixtures too",
+    desc: "per-row tables for every fixture (default output is status lines only)",
     group: "fixture",
   },
   explain: {
     type: "boolean",
-    desc: "for failing fixtures: force expected feet as overrides and report per-category cost deltas; for mirror-asymmetric fixtures: print the per-row mismatches",
-    group: "fixture",
+    desc: "failing fixtures: force expected feet as overrides and report per-category cost deltas plus a per-edge cost breakdown of both paths; diverging charts: add the same per-edge breakdown; mirror-asymmetric fixtures: per-row mismatches with the same base/exp/mir per-edge breakdown",
+    group: "general",
   },
   "no-mirror": {
     type: "boolean",
@@ -73,7 +73,7 @@ const OPTIONS: Record<string, OptSpec> = {
   chart: {
     type: "string",
     arg: "[path]",
-    desc: "chart to compare, or a directory to sweep every .ssc under it (one summary line per chart; -v for full divergence output). With no argument, sweeps the bundled reference-charts corpus",
+    desc: "chart to compare, or a directory to sweep every .ssc under it (one summary line per chart; -v for full divergence output). A value that isn't an existing path is searched for by filename under the working directory. With no argument, sweeps the bundled reference-charts corpus",
     group: "chart",
   },
   difficulty: {
@@ -86,6 +86,18 @@ const OPTIONS: Record<string, OptSpec> = {
     type: "boolean",
     desc: "bake #PARITYGOLDEN from the annotation-guided run",
     group: "chart",
+  },
+  reverse: {
+    type: "boolean",
+    short: "r",
+    desc: "print per-row tables bottom-up (notefield order)",
+    group: "general",
+  },
+  facing: {
+    type: "boolean",
+    short: "f",
+    desc: "show the engine-determined facing (L/F/R) after the feet in per-row tables",
+    group: "general",
   },
   "bpm-factor": {
     type: "string",
@@ -183,6 +195,8 @@ const doGen = values.gen === true
 const verbose = values.verbose === true
 const noMirror = values["no-mirror"] === true
 const explain = values.explain === true
+const reverseRows = values.reverse === true
+const showFacing = values.facing === true
 const chartPath = values.chart as string | undefined
 const bpmFactor =
   values["bpm-factor"] === undefined
@@ -217,6 +231,12 @@ function fmtExpectation(exp: {
   return exp.expectedTechs.join(" ")
 }
 
+// pad to width based on the plain text, then colorize — ANSI codes would
+// otherwise count toward padEnd's length
+function padColored(plain: string, colored: string, width: number): string {
+  return colored + " ".repeat(Math.max(0, width - plain.length))
+}
+
 function fmtFeet(feet: (string | null | undefined)[]): string {
   return [0, 1, 2, 3]
     .map(c => (feet[c] === undefined ? "." : feet[c] === null ? "?" : feet[c]))
@@ -235,11 +255,43 @@ const wantFixtures =
   values.fixtures === true || filters.length > 0 || chartPath === undefined
 const wantCharts =
   chartPath !== undefined || (values.fixtures !== true && filters.length === 0)
-const chartTarget = chartPath ?? (wantCharts ? REFERENCE_CHARTS : undefined)
+let chartTarget = chartPath ?? (wantCharts ? REFERENCE_CHARTS : undefined)
+
+// A --chart value that isn't an existing path is treated as a filename to
+// look up: search the working directory recursively for a file whose name
+// matches (with or without the .ssc extension).
+function findChartByName(name: string): string[] {
+  const wanted = new Set(
+    [name, `${name}.ssc`].map(n => n.toLowerCase())
+  )
+  const matches: string[] = []
+  const entries = fs.readdirSync(process.cwd(), {
+    recursive: true,
+  }) as string[]
+  for (const rel of entries) {
+    const parts = rel.split(path.sep)
+    if (parts.some(p => p === "node_modules" || p.startsWith("."))) continue
+    if (!wanted.has(parts[parts.length - 1].toLowerCase())) continue
+    const abs = path.join(process.cwd(), rel)
+    if (fs.statSync(abs).isFile()) matches.push(abs)
+  }
+  return matches.sort()
+}
 
 if (chartTarget !== undefined && !fs.existsSync(chartTarget)) {
-  console.error(`no such file or directory: ${chartTarget}`)
-  process.exit(2)
+  const matches = chartPath === undefined ? [] : findChartByName(chartPath)
+  if (matches.length === 1) {
+    console.log(`--chart ${chartPath}: found ${matches[0]}`)
+    chartTarget = matches[0]
+  } else if (matches.length > 1) {
+    console.error(
+      `--chart ${chartPath} matches multiple files:\n  ${matches.join("\n  ")}`
+    )
+    process.exit(2)
+  } else {
+    console.error(`no such file or directory: ${chartTarget}`)
+    process.exit(2)
+  }
 }
 const chartIsDir =
   chartTarget !== undefined && fs.statSync(chartTarget).isDirectory()
@@ -276,10 +328,10 @@ async function runChartSweep(sweepDir: string): Promise<number> {
     }
     if (res.kind === "error") {
       errors++
-      console.log(`${RED}ERROR${RESET}  ${res.file}: ${res.message}`)
+      console.log(`${RED}ERROR${RESET}  ${path.relative(sweepDir, res.file)}: ${res.message}`)
       return
     }
-    const name = `${res.title} [${res.difficulty}]`.padEnd(46)
+    const name = `${path.relative(sweepDir, res.file)} [${res.difficulty}]`.padEnd(46)
     if (res.kind === "skip") {
       skipped++
       console.log(
@@ -320,7 +372,8 @@ async function runChartSweep(sweepDir: string): Promise<number> {
         `${RED}DIFF${RESET}   ${name} ${deltaStr.padStart(9)}  ${DIM}to golden, ` +
           `${cmp.segments.length} divergent segment${cmp.segments.length === 1 ? "" : "s"}${RESET}${mirrorTag}`
       )
-      if (verbose) printComparison(cmp, s => console.log("   " + s))
+      if (verbose)
+        printComparison(cmp, s => console.log("   " + s), { edges: explain, reverse: reverseRows, facing: showFacing })
     }
     if (verbose) {
       for (const [label, c] of asym) {
@@ -399,7 +452,7 @@ function runSingleChart(chartFile: string): number {
     difficulty: values.difficulty as string | undefined,
   })
   console.log(
-    `${chart.title} [${chart.difficulty}] — ${chart.notes.length} notes, ` +
+    `${chartFile} [${chart.difficulty}] — ${chart.notes.length} notes, ` +
       (chart.goldenCount
         ? `${chart.goldenCount} golden feet (#PARITYGOLDEN)` +
           (chart.overrideCount
@@ -444,7 +497,7 @@ function runSingleChart(chartFile: string): number {
   const scaledNotes = scaleTempo(chart.notes, bpmFactor)
   if (bpmFactor !== 1) console.log(`${DIM}bpm ×${bpmFactor}${RESET}`)
   const cmp = compareAnnotated(scaledNotes, chart.lastBeat)
-  printComparison(cmp)
+  printComparison(cmp, undefined, { edges: explain, reverse: reverseRows, facing: showFacing })
   if (cmp.identical && cmp.natural.nextBestDelta !== undefined) {
     console.log(
       `${DIM}next-best interpretation costs +${Math.max(0, cmp.natural.nextBestDelta).toFixed(2)}${RESET}`
@@ -476,9 +529,9 @@ function runSingleChart(chartFile: string): number {
   return cmp.identical && mirrorsOk ? 0 : 1
 }
 
-// Force a fixture's expected feet as parity overrides, so the comparison
-// explains WHY the engine deviates from the fixture's ground truth.
-function explainFixture(parsed: ParsedFixture) {
+// Copy of the fixture's notes with every expected foot forced as a parity
+// override, or undefined when the pattern has no foot expectations.
+function forceExpectedFeet(parsed: ParsedFixture): FixtureNote[] | undefined {
   const overridden: FixtureNote[] = parsed.notedata.map(n => ({ ...n }))
   let count = 0
   for (const row of parsed.rows) {
@@ -495,52 +548,152 @@ function explainFixture(parsed: ParsedFixture) {
       }
     }
   }
-  if (count === 0) {
+  return count === 0 ? undefined : overridden
+}
+
+// Force a fixture's expected feet as parity overrides, so the comparison
+// explains WHY the engine deviates from the fixture's ground truth.
+function explainFixture(parsed: ParsedFixture) {
+  const overridden = forceExpectedFeet(parsed)
+  if (overridden === undefined) {
     console.log(`   ${DIM}no expected feet to force${RESET}`)
     return
   }
   const cmp = compareAnnotated(overridden, parsed.lastBeat)
-  printComparison(cmp, s => console.log("   " + s))
+  printComparison(cmp, s => console.log("   " + s), { edges: true, reverse: reverseRows, facing: showFacing })
 }
 
 // Per-row table of a failing mirror run: the base run mapped into mirrored
 // columns (what invariance predicts) against what the engine actually chose.
-function printMirrorRun(name: string, check: MirrorCheck) {
+// With edges, each mismatched edge gets the same side-by-side cost breakdown
+// a regular failing run gets under --explain: base (the reference), exp (the
+// correct feet priced on the mirrored chart), mir (the engine's choice).
+function printMirrorRun(name: string, check: MirrorCheck, edges: boolean) {
   console.log(
-    `   ${YELLOW}${name} run — feet:exp is the base run mirrored:${RESET}`
+    `   ${YELLOW}${name} run — feet:exp is the base run mirrored; cost:exp prices those same feet on the mirrored chart (invariance says base = exp):${RESET}`
   )
+  const totals = [
+    `base path ${check.baseTotal.toFixed(2)}`,
+    `mirrored engine chose ${check.mirroredTotal.toFixed(2)}`,
+  ]
+  if (check.expectedTotal !== undefined) {
+    totals.push(
+      `correct feet on mirrored chart ${check.expectedTotal.toFixed(2)}`
+    )
+  }
+  if (check.mirAtBaseTotal !== undefined) {
+    totals.push(
+      `mirrored route on base chart ${check.mirAtBaseTotal.toFixed(2)}`
+    )
+  }
+  console.log(`   ${DIM}${totals.join("  ·  ")}${RESET}`)
+  if (check.mirAtBaseTotal !== undefined) {
+    console.log(
+      `   ${DIM}correct path prices symmetrically — the asymmetry is on the divergent route; mir@base reprices the mirrored engine's route on the base chart${RESET}`
+    )
+  }
+  if (check.rows.length === 0) {
+    for (const v of check.violations) console.log(`   ${YELLOW}${v}${RESET}`)
+    return
+  }
   console.log(
-    `   ${DIM}${"row".padEnd(4)} ${"beat".padEnd(7)} ${"feet:exp".padEnd(9)} ${"feet:act".padEnd(9)} ${"tech:base".padEnd(11)} ${"tech:mir".padEnd(11)} ${"cost:base→mir".padEnd(15)} err:base→mir${RESET}`
+    `   ${DIM}${"row".padEnd(4)} ${"beat".padEnd(7)} ${"feet:exp".padEnd(9)} ${"feet:act".padEnd(9)} ${showFacing ? "fac:b→m→e".padEnd(10) + " " : ""}${"tech:base".padEnd(11)} ${"tech:mir".padEnd(11)} ${"cost:base→exp".padEnd(15)} err:base→mir${RESET}`
   )
-  for (const r of check.rows) {
+  const rows = reverseRows ? [...check.rows].reverse() : check.rows
+  const edgeDiffers = (a: Record<string, number>, b: Record<string, number>) => {
+    const cats = new Set([...Object.keys(a), ...Object.keys(b)])
+    cats.delete("TOTAL")
+    return [...cats].some(c => Math.abs((a[c] ?? 0) - (b[c] ?? 0)) > 0.005)
+  }
+  for (const r of rows) {
     const mark = r.ok ? `${DIM}·${RESET}` : `${RED}✗${RESET}`
-    const costEqual = Math.abs(r.baseCost - r.mirroredCost) <= 0.005
+    const feetActCell = [...r.actualFeet]
+      .map((ch, c) => (r.expectedFeet[c] !== ch ? `${RED}${ch}${RESET}` : ch))
+      .join("")
+    const techsBad = r.baseTechs.join(" ") !== r.mirroredTechs.join(" ")
+    const techMir = r.mirroredTechs.join(" ") || (techsBad ? "-" : "")
+    const techMirCell = techsBad ? `${RED}${techMir}${RESET}` : techMir
+    // mirrored/priced facing painted red when it breaks the invariance
+    // prediction (e = the run cost:exp actually prices)
+    const facPlain = `${r.baseFacing}→${r.mirroredFacing}→${r.expectedRunFacing}`
+    const paintFac = (f: string) =>
+      f !== r.expectedFacing ? `${RED}${f}${RESET}` : f
+    const facCell = `${r.baseFacing}→${paintFac(r.mirroredFacing)}→${paintFac(r.expectedRunFacing)}`
+    const costEqual = Math.abs(r.baseCost - r.expectedCost) <= 0.005
     const cost = costEqual
       ? `${DIM}${r.baseCost.toFixed(2)}${RESET}${" ".repeat(Math.max(0, 15 - r.baseCost.toFixed(2).length))}`
-      : `${RED}${`${r.baseCost.toFixed(2)}→${r.mirroredCost.toFixed(2)}`.padEnd(15)}${RESET}`
-    const errs =
+      : `${RED}${`${r.baseCost.toFixed(2)}→${r.expectedCost.toFixed(2)}`.padEnd(15)}${RESET}`
+    const picked =
+      Math.abs(r.mirroredCost - r.expectedCost) > 0.005
+        ? ` ${DIM}(picked ${r.mirroredCost.toFixed(2)})${RESET}`
+        : ""
+    const errsPlain =
       r.baseErrors.length || r.mirroredErrors.length
         ? `${r.baseErrors.join(" ") || "-"}→${r.mirroredErrors.join(" ") || "-"}`
         : ""
+    const errsCell =
+      r.baseErrors.join() !== r.mirroredErrors.join()
+        ? `${RED}${errsPlain}${RESET}`
+        : errsPlain
     console.log(
       ` ${mark} ${String(r.row).padEnd(4)} ${r.beat.toFixed(2).padEnd(7)} ` +
-        `${r.expectedFeet.padEnd(9)} ${r.actualFeet.padEnd(9)} ` +
-        `${r.baseTechs.join(" ").padEnd(11)} ${r.mirroredTechs.join(" ").padEnd(11)} ` +
-        `${cost} ${errs}`
+        `${r.expectedFeet.padEnd(9)} ${padColored(r.actualFeet, feetActCell, 9)} ` +
+        `${showFacing ? padColored(facPlain, facCell, 10) + " " : ""}` +
+        `${r.baseTechs.join(" ").padEnd(11)} ${padColored(techMir, techMirCell, 11)} ` +
+        `${cost} ${errsCell}${picked}`
     )
-    for (const d of r.costDiffs) {
-      console.log(`     ${RED}${d}${RESET}`)
+    // cost:exp prices the forced run — if the engine refused an override,
+    // that run stepped something other than feet:exp and the price is off
+    if (r.expectedRunFeet !== r.expectedFeet) {
+      console.log(
+        `     ${YELLOW}priced run stepped ${r.expectedRunFeet}, not feet:exp — override not honored${RESET}`
+      )
+    }
+    const showMirAtBase =
+      r.mirAtBaseEdge !== undefined &&
+      edgeDiffers(r.mirAtBaseEdge, r.mirroredEdge)
+    if (!edges) {
+      for (const d of r.costDiffs) {
+        console.log(`     ${RED}${d}${RESET}`)
+      }
+      for (const d of r.mirCostDiffs ?? []) {
+        console.log(`     ${RED}mir@base: ${d}${RESET}`)
+      }
+    } else if (
+      r.costDiffs.length > 0 ||
+      edgeDiffers(r.mirroredEdge, r.expectedEdge) ||
+      showMirAtBase
+    ) {
+      console.log(`     ${DIM}${"base".padEnd(8)}${RESET} ${fmtEdgeSide(r.baseEdge)}`)
+      console.log(`     ${DIM}${"exp".padEnd(8)}${RESET} ${fmtEdgeSide(r.expectedEdge)}`)
+      console.log(`     ${DIM}${"mir".padEnd(8)}${RESET} ${fmtEdgeSide(r.mirroredEdge)}`)
+      if (showMirAtBase) {
+        console.log(
+          `     ${DIM}${"mir@base".padEnd(8)}${RESET} ${fmtEdgeSide(r.mirAtBaseEdge!)}`
+        )
+      }
     }
   }
 }
 
 // ------------------------------------------------------------ fixture suite
 
+// A filter matches by exact fixture name; * (any run) and ? (any char) turn
+// it into a glob matched against the whole name.
+function fixtureMatcher(q: string): (name: string) => boolean {
+  if (!/[*?]/.test(q)) return name => name === q
+  const re = new RegExp(
+    "^" +
+      q.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") +
+      "$"
+  )
+  return name => re.test(name)
+}
+
 function runFixtures(): number {
+  const matchers = filters.map(fixtureMatcher)
   const selected = FIXTURES.filter(
-    f =>
-      filters.length === 0 ||
-      filters.some(q => f.name.includes(q))
+    f => filters.length === 0 || matchers.some(m => m(f.name))
   )
 
   if (selected.length === 0) {
@@ -595,11 +748,26 @@ function runFixtures(): number {
         console.log(`${DIM}wrote${RESET} ${dir}`)
       }
 
-      const skipped: MirrorCheck = { ok: true, violations: [], tieBreaks: [], rows: [] }
+      const skipped: MirrorCheck = {
+        ok: true,
+        violations: [],
+        tieBreaks: [],
+        rows: [],
+        baseTotal: 0,
+        mirroredTotal: 0,
+      }
       const results = variants.map(variant => {
         const parsed = parseFixture(variant)
         const run = runEngine(parsed.notedata, parsed.lastBeat)
         const report = evaluateFixture(parsed, run)
+        // engine run with the expected feet forced, for the tech:ann column;
+        // only computed when the per-row table can print (-v, or --explain
+        // on a failing fixture — default mode prints no tables)
+        const forced =
+          verbose || (explain && report.problems > 0)
+            ? forceExpectedFeet(parsed)
+            : undefined
+        const annRun = forced ? runEngine(forced, parsed.lastBeat) : undefined
         const mirror = noMirror ? skipped : checkMirror(parsed, run)
         // Front/back (D<->U) invariance is expected to hold at foot granularity
         // just like L/R — part-level heel/toe assignments necessarily flip.
@@ -609,6 +777,7 @@ function runFixtures(): number {
           bpm: variant.bpm,
           parsed,
           run,
+          annRun,
           report,
           mirror,
           udMirror,
@@ -694,46 +863,61 @@ function runFixtures(): number {
       }
 
       for (const r of results) {
+        // Default mode stays at one status line per fixture (the bpm tag
+        // already names the failing tempos); per-row tables and mirror
+        // detail need -v or --explain. Engine errors always surface.
         const show =
-          (!r.pass && !known) || verbose || !r.mirror.ok || (explain && !r.symmetric)
-        if (!show) continue
+          verbose || (explain && ((!r.pass && !known) || !r.symmetric))
+        if (!show) {
+          if (r.report.error && !known) {
+            if (multi) console.log(`   ${DIM}@${r.bpm}:${RESET}`)
+            console.log(`   ${RED}${r.report.error}${RESET}`)
+          }
+          continue
+        }
         if (multi) console.log(`   ${DIM}@${r.bpm}:${RESET}`)
         if (r.report.error) {
           console.log(`   ${RED}${r.report.error}${RESET}`)
         }
         if (!r.pass || verbose) {
           console.log(
-            `   ${DIM}${"row".padEnd(4)} ${"beat".padEnd(7)} ${"cols".padEnd(5)} ${"feet:exp".padEnd(9)} ${"feet:act".padEnd(9)} ${"tech:exp".padEnd(10)} ${"tech:act".padEnd(10)} ${"cost".padEnd(8)} err${RESET}`
+            `   ${DIM}${"row".padEnd(4)} ${"beat".padEnd(7)} ${"cols".padEnd(5)} ${"feet:exp".padEnd(9)} ${"feet:act".padEnd(9)} ${showFacing ? "fac".padEnd(4) + " " : ""}${"tech:exp".padEnd(10)} ${"tech:act".padEnd(10)} ${"tech:ann".padEnd(10)} ${"cost".padEnd(8)} err${RESET}`
           )
-          for (const [i, row] of r.report.rows.entries()) {
+          const rowEntries = [...r.report.rows.entries()]
+          if (reverseRows) rowEntries.reverse()
+          for (const [i, row] of rowEntries) {
             const exp = row.expectation
             const mark = row.problems.length ? `${RED}✗${RESET}` : `${DIM}·${RESET}`
             const cost = r.run.edgeCosts[i]?.["TOTAL"] ?? 0
+            const beat = exp.beat.toFixed(2)
+            const beatCell = row.badBeat ? `${RED}${beat}${RESET}` : beat
+            const feetAct = fmtFeet(row.actual.feet)
+            const feetActCell = [...feetAct]
+              .map((ch, col) =>
+                row.badCols.includes(col) ? `${RED}${ch}${RESET}` : ch
+              )
+              .join("")
+            // a tech mismatch with no actual techs still needs something to
+            // paint red, or the mismatch is invisible in the row
+            const techAct =
+              row.actual.techs.join(" ") || (row.badTechs ? "-" : "")
+            const techActCell = row.badTechs ? `${RED}${techAct}${RESET}` : techAct
+            const techAnn = (r.annRun ?? r.run).rows[i]?.techs.join(" ") ?? ""
             console.log(
-              ` ${mark} ${String(i).padEnd(4)} ${exp.beat.toFixed(2).padEnd(7)} ${exp.chars.padEnd(5)} ` +
-                `${fmtFeet(exp.feet).padEnd(9)} ${fmtFeet(row.actual.feet).padEnd(9)} ` +
-                `${fmtExpectation(exp).padEnd(10)} ${row.actual.techs.join(" ").padEnd(10)} ` +
+              ` ${mark} ${String(i).padEnd(4)} ${padColored(beat, beatCell, 7)} ${exp.chars.padEnd(5)} ` +
+                `${fmtFeet(exp.feet).padEnd(9)} ${padColored(feetAct, feetActCell, 9)} ` +
+                `${showFacing ? (r.run.facings[i] ?? "?").padEnd(4) + " " : ""}` +
+                `${fmtExpectation(exp).padEnd(10)} ${padColored(techAct, techActCell, 10)} ` +
+                `${techAnn.padEnd(10)} ` +
                 `${cost.toFixed(2).padEnd(8)} ${row.actual.errors.join(" ")}`
             )
-            for (const p of row.problems) {
-              console.log(`     ${RED}${p}${RESET}`)
-            }
           }
         }
-        for (const d of r.mirror.violations.slice(0, 8)) {
-          console.log(`   ${YELLOW}mirror: ${d}${RESET}`)
-        }
-        if (verbose || explain) {
-          for (const d of r.udMirror.violations.slice(0, 8)) {
-            console.log(`   ${YELLOW}ud-mirror: ${d}${RESET}`)
-          }
-          for (const d of r.lrudMirror.violations.slice(0, 8)) {
-            console.log(`   ${YELLOW}lrud-mirror: ${d}${RESET}`)
-          }
-          if (!r.mirror.ok) printMirrorRun("mirror", r.mirror)
-          if (!r.udMirror.ok) printMirrorRun("ud-mirror", r.udMirror)
-          if (!r.lrudMirror.ok) printMirrorRun("lrud-mirror", r.lrudMirror)
-        }
+        // per-beat violation lines are omitted here: the per-row tables below
+        // show every mismatch with highlights
+        if (!r.mirror.ok) printMirrorRun("mirror", r.mirror, explain)
+        if (!r.udMirror.ok) printMirrorRun("ud-mirror", r.udMirror, explain)
+        if (!r.lrudMirror.ok) printMirrorRun("lrud-mirror", r.lrudMirror, explain)
         if (verbose) {
           for (const d of r.mirror.tieBreaks.slice(0, 8)) {
             console.log(`   ${DIM}mirror tie-break: ${d}${RESET}`)
@@ -774,6 +958,20 @@ function runFixtures(): number {
   console.log("─".repeat(60))
   const knownCount = summary.filter(s => s.startsWith("KNOWN")).length
   const partialCount = summary.filter(s => s.startsWith("PARTIAL")).length
+  // "invariance holds" is only claimed when every mirror check ran and
+  // passed; otherwise each asymmetric mirror type is listed with its count
+  const asymParts = [
+    [mirrorFailures, "lr"],
+    [udAsymmetries, "ud"],
+    [lrudAsymmetries, "lrud"],
+  ]
+    .filter(([n]) => n)
+    .map(([n, label]) => `${YELLOW}${n} ${label}-mirror-asymmetric${RESET}`)
+  const mirrorSummary = noMirror
+    ? `, ${DIM}mirror checks skipped${RESET}`
+    : asymParts.length
+      ? `, ${asymParts.join(", ")}`
+      : ", mirror invariance holds (lr, ud, lrud)"
   console.log(
     `${summary.filter(s => s.startsWith("PASS")).length}/${selected.length} fixtures pass` +
       (partialCount
@@ -781,16 +979,15 @@ function runFixtures(): number {
         : "") +
       (knownCount ? `, ${knownCount} known issues` : "") +
       (failures ? `, ${RED}${failures} unexpected failures${RESET}` : "") +
-      (mirrorFailures
-        ? `, ${YELLOW}${mirrorFailures} mirror-asymmetric${RESET}`
-        : ", mirror invariance holds") +
-      (udAsymmetries
-        ? `, ${YELLOW}${udAsymmetries} ud-mirror-asymmetric${RESET}`
-        : ", ud-mirror invariance holds") +
-      (lrudAsymmetries
-        ? `, ${YELLOW}${lrudAsymmetries} lrud-mirror-asymmetric${RESET}`
-        : ", lrud-mirror invariance holds")
+      mirrorSummary
   )
+  if (
+    !verbose &&
+    !explain &&
+    (failures || partialCount || mirrorFailures || udAsymmetries || lrudAsymmetries)
+  ) {
+    console.log(`${DIM}(-v or --explain for per-row detail)${RESET}`)
+  }
   return failures > 0 ? 1 : 0
 }
 

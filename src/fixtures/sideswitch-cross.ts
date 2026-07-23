@@ -1,14 +1,16 @@
 import type { FixtureDef } from "../dsl"
 
 export default {
-  // JA/DS preference is around 70bpm
   bpm: 150,
   subdivision: 16,
   pattern: `
     ...R
     .L..
-    R...   | XO
-    L...   | SS
     ..R.
+    L...
+    R...   | SS XO
+    ..L.
+    ...R
   `,
+  knownIssue: "Development needed for facing detection for this ambiguous pattern"
 } satisfies FixtureDef

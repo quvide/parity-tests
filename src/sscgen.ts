@@ -8,7 +8,7 @@ export const GEN_DIR = ".tmp-fixture-ssc"
 function sscChar(c: string): string {
   if (c === "1" || c === "L" || c === "R") return "1"
   if (c === "2" || c === "l" || c === "r") return "2"
-  if (c === "3") return "3"
+  if (c === "_") return "3"
   if (c === "M") return "M"
   return "0"
 }

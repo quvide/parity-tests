@@ -1,14 +1,13 @@
 import type { FixtureDef } from "../dsl"
 
 export default {
-  // JA/DS preference is around 70bpm
+  description: "A single -> bracket is interpreted as a doublestep",
   bpm: 150,
   subdivision: 16,
   pattern: `
+    l...
     ...R
-    .L..
-    R...   | XO
-    L...   | SS
-    ..R.
+    ..RR | BR DS
+    _...
   `,
 } satisfies FixtureDef

@@ -1,6 +1,7 @@
 import "./shim"
 import { ParityInternals } from "../../smeditor/app/src/chart/stats/parity/ParityInternals"
 import {
+  FacingLabels,
   Foot,
   TechCategory,
   TechErrors,
@@ -37,6 +38,8 @@ export interface EngineRun {
   techCounts: Record<string, number>
   /** footColumns (col per foot part) of the chosen state at each row */
   footColumns: number[][]
+  /** facing label ("L" | "F" | "R") of the chosen state at each row */
+  facings: string[]
   /** cost-category breakdown of the best-path edge INTO each row */
   edgeCosts: Record<string, number>[]
   /** raw part-level labels: "beat-col" -> Foot (heel/toe resolution) */
@@ -89,12 +92,14 @@ export function runEngine(
   const anyInternals = internals as any
   const path: string[] = internals.bestPath ?? []
   const footColumns: number[][] = []
+  const facings: string[] = []
   const edgeCosts: Record<string, number>[] = []
   let node = anyInternals.initialNode
   for (let i = 1; i < path.length - 1; i++) {
     const child = internals.nodeMap.get(path[i])!
     edgeCosts.push(node.children.get(path[i]) ?? {})
     footColumns.push([...child.state.footColumns])
+    facings.push(FacingLabels[child.state.facing])
     node = child
   }
 
@@ -104,6 +109,7 @@ export function runEngine(
     nextBestDelta: withNextBest ? computeNextBestDelta(internals) : undefined,
     techCounts,
     footColumns,
+    facings,
     edgeCosts,
     labels: result.parityLabels,
   }
@@ -211,11 +217,50 @@ export interface MirrorRow {
   mirroredTechs: string[]
   baseErrors: string[]
   mirroredErrors: string[]
-  /** TOTAL of the best-path edge into this row, base vs mirrored run */
+  /** facing of each run's chosen state ("L" | "F" | "R") */
+  baseFacing: string
+  mirroredFacing: string
+  /**
+   * facing invariance predicts on the mirrored chart: a single-axis mirror
+   * (LR or UD) flips the body's rotation L<->R, a 180° rotation preserves it
+   */
+  expectedFacing: string
+  /**
+   * what the priced (exp) run actually stepped — equals expectedFeet unless
+   * the engine refused a forced override. The mirrored run's feet when no
+   * forced run was needed (the chosen path already is the correct one).
+   */
+  expectedRunFeet: string
+  /** facing of the priced (exp) run's chosen state at this row */
+  expectedRunFacing: string
+  /** TOTAL of the best-path edge into this row on the base chart */
   baseCost: number
+  /** TOTAL of the edge the mirrored engine actually chose */
   mirroredCost: number
-  /** cost categories whose edge cost differs, formatted "CAT base→mir" */
+  /**
+   * TOTAL of the CORRECT edge on the mirrored chart — the base run's feet
+   * forced as overrides. Invariance says this equals baseCost; when the
+   * mirrored run already took the expected path it equals mirroredCost too.
+   */
+  expectedCost: number
+  /**
+   * cost categories where the correct mirrored edge disagrees with the base
+   * edge (invariance says none should), formatted "CAT base→exp"
+   */
   costDiffs: string[]
+  /** full cost-category breakdown of each edge, for --explain display */
+  baseEdge: Record<string, number>
+  expectedEdge: Record<string, number>
+  mirroredEdge: Record<string, number>
+  /**
+   * The mirrored engine's chosen route priced on the BASE chart (round-trip).
+   * Only set when the correct path prices symmetrically (every costDiffs
+   * empty) yet the totals differ — the asymmetry then lives on the divergent
+   * route, and invariance says this edge must equal mirroredEdge.
+   */
+  mirAtBaseEdge?: Record<string, number>
+  /** categories where the round-trip disagrees, formatted "CAT mir→mir@base" */
+  mirCostDiffs?: string[]
   ok: boolean
 }
 
@@ -227,6 +272,13 @@ export interface MirrorCheck {
   tieBreaks: string[]
   /** per-row expected-vs-actual of the mirrored run, for step-level display */
   rows: MirrorRow[]
+  /** best-path totals: base chart and what the mirrored engine chose */
+  baseTotal: number
+  mirroredTotal: number
+  /** the correct (base-mirrored) feet priced on the mirrored chart, when computed */
+  expectedTotal?: number
+  /** the mirrored engine's route priced back on the base chart, when computed */
+  mirAtBaseTotal?: number
 }
 
 /**
@@ -236,9 +288,15 @@ export interface MirrorCheck {
  * reported separately as tie-breaks (a deterministic solver must pick one side
  * of a genuine 50/50; that is not an asymmetry in the cost model).
  */
+const flipLR = (f: string) => (f === "L" ? "R" : f === "R" ? "L" : f)
+
 export function checkMirror(input: MirrorInput, base: EngineRun): MirrorCheck {
-  return checkMirrorWith(input, base, MIRROR_COL, f =>
-    f === "L" ? "R" : f === "R" ? "L" : f
+  return checkMirrorWith(
+    input,
+    base,
+    MIRROR_COL,
+    f => (f === "L" ? "R" : f === "R" ? "L" : f),
+    flipLR
   )
 }
 
@@ -247,7 +305,7 @@ export function checkUDMirror(
   input: MirrorInput,
   base: EngineRun
 ): MirrorCheck {
-  return checkMirrorWith(input, base, UD_MIRROR_COL, f => f)
+  return checkMirrorWith(input, base, UD_MIRROR_COL, f => f, flipLR)
 }
 
 /** 180° rotation (LR+UD): columns fully reversed, feet flip sides */
@@ -255,8 +313,12 @@ export function checkLRUDMirror(
   input: MirrorInput,
   base: EngineRun
 ): MirrorCheck {
-  return checkMirrorWith(input, base, LRUD_MIRROR_COL, f =>
-    f === "L" ? "R" : f === "R" ? "L" : f
+  return checkMirrorWith(
+    input,
+    base,
+    LRUD_MIRROR_COL,
+    f => (f === "L" ? "R" : f === "R" ? "L" : f),
+    f => f
   )
 }
 
@@ -264,12 +326,12 @@ function checkMirrorWith(
   input: MirrorInput,
   base: EngineRun,
   colMap: number[],
-  flip: (f: string | undefined) => string | undefined
+  flip: (f: string | undefined) => string | undefined,
+  /** what the base state's facing maps to under this transform */
+  facingFlip: (f: string) => string
 ): MirrorCheck {
-  const mirrored = runEngine(
-    mirrorWith(input.notedata, colMap),
-    input.lastBeat
-  )
+  const mirroredNotes = mirrorWith(input.notedata, colMap)
+  const mirrored = runEngine(mirroredNotes, input.lastBeat)
   const violations: string[] = []
   const tieBreaks: string[] = []
   const rows: MirrorRow[] = []
@@ -279,46 +341,90 @@ function checkMirrorWith(
       violations: [`row count ${mirrored.rows.length} != ${base.rows.length}`],
       tieBreaks: [],
       rows: [],
+      baseTotal: base.bestPathCost,
+      mirroredTotal: mirrored.bestPathCost,
     }
   }
   const costEqual =
     Math.abs(mirrored.bestPathCost - base.bestPathCost) <= 0.01
+  const expectedFeetRows: (string | undefined)[][] = []
+  let feetDiverged = false
   for (let i = 0; i < base.rows.length; i++) {
     const b = base.rows[i]
     const m = mirrored.rows[i]
     const expectedFeet: (string | undefined)[] = []
-    let feetOk = true
     for (let col = 0; col < 4; col++) {
       const expected = flip(b.feet[col])
       expectedFeet[colMap[col]] = expected
       const actual = m.feet[colMap[col]]
       if (expected !== actual) {
-        feetOk = false
+        feetDiverged = true
         const msg = `beat ${b.beat}: col ${col} ${b.feet[col]} mirrored to ${actual ?? "-"} (expected ${expected ?? "-"})`
         ;(costEqual ? tieBreaks : violations).push(msg)
       }
     }
-    const techsOk = b.techs.join() === m.techs.join()
-    if (!techsOk) {
+    expectedFeetRows.push(expectedFeet)
+    if (b.techs.join() !== m.techs.join()) {
       violations.push(
         `beat ${b.beat}: techs [${b.techs}] vs mirrored [${m.techs}]`
       )
     }
-    const errorsOk = b.errors.join() === m.errors.join()
-    if (!errorsOk) {
+    if (b.errors.join() !== m.errors.join()) {
       violations.push(
         `beat ${b.beat}: errors [${b.errors}] vs mirrored [${m.errors}]`
       )
     }
+  }
+
+  // Edge costs are compared against the CORRECT edge on the mirrored chart.
+  // Once the mirrored engine picks different feet, its best-path edges belong
+  // to a different route, and diffing them against the base edges conflates
+  // cost asymmetry with route choice. Forcing the expected feet as overrides
+  // prices the base path on the mirrored chart; invariance says those edges
+  // equal the base edges category-by-category, so any diff is the asymmetric
+  // cost term itself. When the runs agree the chosen path IS the correct one
+  // and no extra engine run is needed.
+  let expected: EngineRun | undefined
+  if (feetDiverged) {
+    const forced: FixtureNote[] = mirroredNotes.map(n => ({
+      ...n,
+      parity: undefined,
+    }))
+    const byKey = new Map(
+      forced.map(n => [n.beat.toFixed(3) + "-" + n.col, n])
+    )
+    for (let i = 0; i < base.rows.length; i++) {
+      const beat = base.rows[i].beat
+      for (let col = 0; col < 4; col++) {
+        const f = expectedFeetRows[i][col]
+        if (f !== "L" && f !== "R") continue
+        const note = byKey.get(beat.toFixed(3) + "-" + col)
+        if (note) note.parity = { override: f === "L" ? "Left" : "Right" }
+      }
+    }
+    try {
+      const run = runEngine(forced, input.lastBeat)
+      if (run.rows.length === base.rows.length) expected = run
+    } catch {
+      // diagnostic only — fall back to comparing the chosen edges
+    }
+  }
+
+  for (let i = 0; i < base.rows.length; i++) {
+    const b = base.rows[i]
+    const m = mirrored.rows[i]
+    const expectedFeet = expectedFeetRows[i]
+    const feetOk = [0, 1, 2, 3].every(c => expectedFeet[c] === m.feet[c])
     const bEdge = base.edgeCosts[i] ?? {}
     const mEdge = mirrored.edgeCosts[i] ?? {}
-    const costDiffs = [...new Set([...Object.keys(bEdge), ...Object.keys(mEdge)])]
+    const eEdge = expected ? expected.edgeCosts[i] ?? {} : mEdge
+    const costDiffs = [...new Set([...Object.keys(bEdge), ...Object.keys(eEdge)])]
       .filter(cat => cat !== "TOTAL")
-      .filter(cat => Math.abs((bEdge[cat] ?? 0) - (mEdge[cat] ?? 0)) > 0.005)
+      .filter(cat => Math.abs((bEdge[cat] ?? 0) - (eEdge[cat] ?? 0)) > 0.005)
       .sort()
       .map(
         cat =>
-          `${cat} ${(bEdge[cat] ?? 0).toFixed(2)}→${(mEdge[cat] ?? 0).toFixed(2)}`
+          `${cat} ${(bEdge[cat] ?? 0).toFixed(2)}→${(eEdge[cat] ?? 0).toFixed(2)}`
       )
     rows.push({
       row: i,
@@ -329,16 +435,100 @@ function checkMirrorWith(
       mirroredTechs: m.techs,
       baseErrors: b.errors,
       mirroredErrors: m.errors,
+      baseFacing: base.facings[i] ?? "?",
+      mirroredFacing: mirrored.facings[i] ?? "?",
+      expectedFacing:
+        base.facings[i] === undefined ? "?" : facingFlip(base.facings[i]),
+      expectedRunFeet: expected
+        ? [0, 1, 2, 3].map(c => expected.rows[i].feet[c] ?? ".").join("")
+        : [0, 1, 2, 3].map(c => m.feet[c] ?? ".").join(""),
+      expectedRunFacing:
+        (expected ? expected.facings[i] : mirrored.facings[i]) ?? "?",
       baseCost: bEdge["TOTAL"] ?? 0,
       mirroredCost: mEdge["TOTAL"] ?? 0,
+      expectedCost: eEdge["TOTAL"] ?? 0,
       costDiffs,
-      ok: feetOk && techsOk && errorsOk && costDiffs.length === 0,
+      baseEdge: bEdge,
+      expectedEdge: eEdge,
+      mirroredEdge: mEdge,
+      ok:
+        feetOk &&
+        b.techs.join() === m.techs.join() &&
+        b.errors.join() === m.errors.join() &&
+        costDiffs.length === 0,
     })
   }
+  // When the correct path prices identically on both charts yet the totals
+  // differ, the asymmetry lives on the DIVERGENT route: the mirrored engine
+  // found a cheaper path whose mirror image must be pricier on the base chart
+  // (the base engine is optimal). Round-trip that route — force the mirrored
+  // engine's feet, mapped back through the mirror, onto the base chart — and
+  // diff it edge-by-edge against the mirrored pricing; invariance says the
+  // two pricings of the same route must match category-by-category.
+  let roundTrip: EngineRun | undefined
+  if (
+    expected !== undefined &&
+    !costEqual &&
+    rows.every(r => r.costDiffs.length === 0)
+  ) {
+    const forced: FixtureNote[] = input.notedata.map(n => ({
+      ...n,
+      parity: undefined,
+    }))
+    const byKey = new Map(
+      forced.map(n => [n.beat.toFixed(3) + "-" + n.col, n])
+    )
+    for (const m of mirrored.rows) {
+      for (let mc = 0; mc < 4; mc++) {
+        const f = flip(m.feet[mc])
+        if (f !== "L" && f !== "R") continue
+        const note = byKey.get(m.beat.toFixed(3) + "-" + colMap[mc])
+        if (note) note.parity = { override: f === "L" ? "Left" : "Right" }
+      }
+    }
+    try {
+      const run = runEngine(forced, input.lastBeat)
+      if (run.rows.length === base.rows.length) roundTrip = run
+    } catch {
+      // diagnostic only
+    }
+    if (roundTrip) {
+      for (let i = 0; i < rows.length; i++) {
+        const mEdge = mirrored.edgeCosts[i] ?? {}
+        const rtEdge = roundTrip.edgeCosts[i] ?? {}
+        rows[i].mirAtBaseEdge = rtEdge
+        rows[i].mirCostDiffs = [
+          ...new Set([...Object.keys(mEdge), ...Object.keys(rtEdge)]),
+        ]
+          .filter(cat => cat !== "TOTAL")
+          .filter(cat => Math.abs((mEdge[cat] ?? 0) - (rtEdge[cat] ?? 0)) > 0.005)
+          .sort()
+          .map(
+            cat =>
+              `${cat} ${(mEdge[cat] ?? 0).toFixed(2)}→${(rtEdge[cat] ?? 0).toFixed(2)}`
+          )
+      }
+    }
+  }
+
   if (!costEqual) {
-    violations.push(
-      `best path cost ${base.bestPathCost.toFixed(2)} vs mirrored ${mirrored.bestPathCost.toFixed(2)}`
+    // first, not last: contexts that truncate the violation list must not
+    // hide the one line that says which kind of asymmetry this is
+    violations.unshift(
+      `best path cost ${base.bestPathCost.toFixed(2)} vs mirrored ${mirrored.bestPathCost.toFixed(2)}` +
+        (expected
+          ? ` (correct feet on the mirrored chart cost ${expected.bestPathCost.toFixed(2)})`
+          : "")
     )
   }
-  return { ok: violations.length === 0, violations, tieBreaks, rows }
+  return {
+    ok: violations.length === 0,
+    violations,
+    tieBreaks,
+    rows,
+    baseTotal: base.bestPathCost,
+    mirroredTotal: mirrored.bestPathCost,
+    expectedTotal: expected?.bestPathCost,
+    mirAtBaseTotal: roundTrip?.bestPathCost,
+  }
 }

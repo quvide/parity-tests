@@ -5,6 +5,12 @@ export interface RowReport {
   expectation: RowExpectation
   actual: EngineRow
   problems: string[]
+  /** columns whose actual foot doesn't match the expectation */
+  badCols: number[]
+  /** the row's tech tags don't match the expectation */
+  badTechs: boolean
+  /** engine row landed on a different beat than the fixture line */
+  badBeat: boolean
 }
 
 export interface FixtureReport {
@@ -45,10 +51,14 @@ export function evaluateFixture(
     // notation problems (tech tags / tech errors) are counted separately from
     // foot problems so the runner can report feet-correct fixtures as PARTIAL
     let footProblems = 0
+    const badCols: number[] = []
+    let badTechs = false
+    let badBeat = false
 
     if (Math.abs(exp.beat - act.beat) > 1e-6) {
       problems.push(`row beat mismatch: expected ${exp.beat}, got ${act.beat}`)
       footProblems++
+      badBeat = true
     } else if (!exp.skip) {
       for (let col = 0; col < 4; col++) {
         const want = exp.feet[col]
@@ -58,6 +68,7 @@ export function evaluateFixture(
             `col ${col}: expected ${want} foot, got ${act.feet[col] ?? "-"}`
           )
           footProblems++
+          badCols.push(col)
         }
       }
       const wantTechs = [...exp.expectedTechs].sort().join(" ")
@@ -66,10 +77,18 @@ export function evaluateFixture(
         problems.push(
           `techs: expected [${wantTechs || "none"}], got [${gotTechs || "none"}]`
         )
+        badTechs = true
       }
     }
 
-    report.rows.push({ expectation: exp, actual: act, problems })
+    report.rows.push({
+      expectation: exp,
+      actual: act,
+      problems,
+      badCols,
+      badTechs,
+      badBeat,
+    })
     report.problems += problems.length
     report.footProblems += footProblems
     report.notationProblems += problems.length - footProblems
