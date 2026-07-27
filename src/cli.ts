@@ -678,10 +678,12 @@ function printMirrorRun(name: string, check: MirrorCheck, edges: boolean) {
 
 // ------------------------------------------------------------ fixture suite
 
-// A filter matches by exact fixture name; * (any run) and ? (any char) turn
-// it into a glob matched against the whole name.
+// A filter matches by exact fixture name — a multi-variant file's bare
+// filename selects all of its `file.variant` entries; * (any run) and
+// ? (any char) turn it into a glob matched against the whole name.
 function fixtureMatcher(q: string): (name: string) => boolean {
-  if (!/[*?]/.test(q)) return name => name === q
+  if (!/[*?]/.test(q))
+    return name => name === q || name.startsWith(q + ".")
   const re = new RegExp(
     "^" +
       q.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") +

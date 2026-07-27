@@ -51,9 +51,34 @@ export interface Fixture {
 
 /**
  * Shape of a per-file fixture module's default export: the fixture minus its
- * name, which the loader derives from the filename.
+ * name, which the loader derives from the filename. A file may instead export
+ * a list of named variants (FixtureVariantDef[]) — used to annotate competing
+ * interpretations of the same arrow pattern, e.g. a repeat that reads as a
+ * footswitch at high tempo but a jack below the time gate. Each variant is
+ * registered as `<filename>.<variant>`.
  */
 export type FixtureDef = Omit<Fixture, "name">
+export type FixtureVariantDef = FixtureDef & { variant: string }
+
+/**
+ * A pattern's arrow skeleton: the grid lines with comments and expectation
+ * tokens stripped and foot letters anonymized (L/R -> 1, l/r -> 2). The
+ * arrows are a variant fixture's shared identity — every variant in a file
+ * must have the same skeleton, and only feet and tech annotations may
+ * differ between readings. Tap-vs-hold is deliberately part of the skeleton:
+ * variants may not disagree on note types, only on which foot plays them.
+ */
+export function arrowSkeleton(pattern: string): string[] {
+  const lines: string[] = []
+  for (const raw of pattern.split("\n")) {
+    let text = raw.replace(/\/\/.*$/, "").trim()
+    const pipe = text.indexOf("|")
+    if (pipe !== -1) text = text.slice(0, pipe).trim()
+    if (text === "") continue
+    lines.push(text.replace(/[LR]/g, "1").replace(/[lr]/g, "2"))
+  }
+  return lines
+}
 
 /** A runnable fixture variant: bpm resolved to a single tempo. */
 export type ResolvedFixture = Fixture & { bpm: number }
