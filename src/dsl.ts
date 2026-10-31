@@ -20,6 +20,10 @@
 // Expectation tokens (only on lines that contain at least one tap/hold head):
 //   FS XO SS JA BR DS HS JU BT SJ KS   row's tech annotations must equal
 //                          EXACTLY the set of listed techs (order-insensitive)
+//   SJ sits on the jump row in place of JU: a two-arrow jump whose adjacent
+//   single (the row before or after, within 0.5 s) is on one of the jump's
+//   panels, so that foot stays planted across the jump. The single rows carry
+//   nothing, and the planted foot's re-press is not a JA.
 //   *                      skip all checks for this row
 //
 // A note line with no `|` section asserts: no tech annotations (the empty
@@ -31,7 +35,6 @@
 
 export interface Fixture {
   name: string
-  description?: string
   /**
    * A single bpm is auto-tested at -50/-25/+25/+50 offsets as well; an
    * explicit array runs exactly the listed tempos. Failing tempos are noted
@@ -40,13 +43,52 @@ export interface Fixture {
   bpm: number | number[]
   /** lines per measure, SM convention: 8 = 8th notes, 16 = 16th notes */
   subdivision: number
-  pattern: string
+  /**
+   * The preferred reading. Optional when `patterns` is given: the first
+   * `patterns` entry is then the preferred reading.
+   */
+  pattern?: string
   /**
    * Set when the fixture intentionally tracks an open engine finding.
    * A failing known-issue fixture doesn't fail the suite; a PASSING one is
    * reported so the marker can be removed.
    */
   knownIssue?: string
+  /**
+   * Competing readings of the same arrows, name -> pattern, same skeleton,
+   * preferred reading first (or in `pattern`). The fixture passes when the
+   * engine's path matches any reading; every other reading is forced through
+   * the engine and its cost gap to the engine's choice is reported.
+   */
+  patterns?: Record<string, string>
+  /**
+   * With `patterns`: the largest gap a non-chosen reading may have before the
+   * fixture fails. Asserts that the engine prices the readings as close
+   * alternatives, without asserting which one wins.
+   */
+  margin?: number
+}
+
+/** The preferred reading: `pattern`, else the first `patterns` entry. */
+export function preferredPattern(fixture: Pick<Fixture, "pattern" | "patterns">): string {
+  const p = fixture.pattern ?? Object.values(fixture.patterns ?? {})[0]
+  if (typeof p !== "string") throw new Error("fixture has neither pattern nor patterns")
+  return p
+}
+
+/** The fixture's readings, preferred first; a `patterns` entry whose text equals `pattern` lends it its name. */
+export function fixtureReadings(fixture: Fixture): { name: string; pattern: string }[] {
+  const norm = (p: string) => arrowSkeletonLines(p).join("\n")
+  const alts = Object.entries(fixture.patterns ?? {})
+  if (fixture.pattern === undefined) return alts.map(([name, pattern]) => ({ name, pattern }))
+  const same = alts.find(([, p]) => norm(p) === norm(fixture.pattern!))
+  const out = [{ name: same?.[0] ?? "pattern", pattern: fixture.pattern }]
+  for (const [name, pattern] of alts) if (name !== same?.[0]) out.push({ name, pattern })
+  return out
+}
+
+function arrowSkeletonLines(pattern: string): string[] {
+  return pattern.split("\n").map(l => l.replace(/\/\/.*$/, "").trim()).filter(Boolean)
 }
 
 /**
@@ -59,6 +101,23 @@ export interface Fixture {
  */
 export type FixtureDef = Omit<Fixture, "name">
 export type FixtureVariantDef = FixtureDef & { variant: string }
+/**
+ * A file may instead export related but independent fixtures (different
+ * arrows, e.g. the labelling rules after a jump) as `{ bpm, subdivision,
+ * cases }`: each case is registered as `<filename>.<case>`, inherits the
+ * shared tempo and subdivision unless it sets its own, and there is no
+ * shared-skeleton check.
+ */
+export type FixtureCaseDef = Omit<FixtureDef, "bpm" | "subdivision"> & {
+  case: string
+  bpm?: Fixture["bpm"]
+  subdivision?: number
+}
+export type FixtureCasesDef = {
+  bpm?: Fixture["bpm"]
+  subdivision?: number
+  cases: FixtureCaseDef[]
+}
 
 /**
  * A pattern's arrow skeleton: the grid lines with comments and expectation
@@ -181,7 +240,7 @@ export function parseFixture(fixture: ResolvedFixture): ParsedFixture {
   // deferred hold notes so we can fill in length when the tail appears
   const holdNotes: (FixtureNote | null)[] = [null, null, null, null]
 
-  const rawLines = fixture.pattern.split("\n")
+  const rawLines = preferredPattern(fixture).split("\n")
   for (const raw of rawLines) {
     let text = raw.replace(/\/\/.*$/, "").trim()
     if (text === "") continue

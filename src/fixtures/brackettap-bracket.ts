@@ -1,7 +1,8 @@
 import type { FixtureDef } from "../dsl"
 
+// Somewhat hard-to-interpret pattern from XXXX GiRL. 
+// L holds LU and brackettaps L on the same row as R brackets DR.
 export default {
-  description: "Somewhat hard-to-interpret pattern from XXXX Girl. L holds LU and brackettaps L on the same row as R brackets DR.",
   bpm: 155,
   subdivision: 16,
   pattern: `
@@ -20,5 +21,4 @@ export default {
     L...
     ...R
   `,
-  knownIssue: "TODO: BRACKETTAP is broken.",
 } satisfies FixtureDef

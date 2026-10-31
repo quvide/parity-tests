@@ -1,7 +1,7 @@
 import type { FixtureDef } from "../dsl"
 
+// Complex XO-SS-BR-FS patterns from VIBE_CHECK
 export default {
-  description: "Complex XO-SS-BR-FS patterns from VIBE_CHECK",
   bpm: [128, 150],
   subdivision: 16,
   pattern: `

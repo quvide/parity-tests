@@ -1,7 +1,7 @@
 import type { FixtureDef } from "../dsl"
 
+// Bracket footswitch from XXXX GiRL
 export default {
-  description: "Bracket footswitch from XXXX Girl",
   bpm: 155,
   subdivision: 16,
   pattern: `

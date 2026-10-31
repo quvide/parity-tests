@@ -1,29 +1,49 @@
-import type { FixtureDef } from "../dsl"
+import type { FixtureCasesDef } from "../dsl"
 
+// Footswitches at 16ths, alone, repeated and mined
 export default {
-  bpm: 150,
+  bpm: [125, 150, 175, 200],
   subdivision: 16,
-  pattern: `
-  // single
-    L...
-    ..R.
-    ..L.   | FS
-    ...R
-  // double
-    .L..
-    .R..   | FS
-    .L..   | FS
-    ...R
-  // triple
-    .L..
-    .R..   | FS
-    .L..   | FS
-    .R..   | FS
-    L...
-  // with a mine
-    ..R.
-    .M..
-    ..L.   | FS
-    ...R
-  `,
-} satisfies FixtureDef
+  cases: [
+    {
+      case: "single",
+      pattern: `
+        L...
+        ..R.
+        ..L.   | FS
+        ...R
+      `,
+    },
+    {
+      case: "double",
+      pattern: `
+        ...R
+        .L..
+        .R..   | FS
+        .L..   | FS
+        ...R
+      `,
+    },
+    {
+      case: "triple",
+      pattern: `
+        ...R
+        .L..
+        .R..   | FS
+        .L..   | FS
+        .R..   | FS
+        L...
+      `,
+    },
+    {
+      case: "mine",
+      pattern: `
+        L...
+        ..R.
+        .M..
+        ..L.   | FS
+        ...R
+      `,
+    },
+  ],
+} satisfies FixtureCasesDef

@@ -51,7 +51,7 @@ export function generateSong(parsed: ParsedFixture, songsRoot: string): string {
 #TITLE:${fixture.name};
 #SUBTITLE:;
 #ARTIST:parity-tests;
-#CREDIT:${(fixture.description ?? "").replace(/[;:]/g, ",")};
+#CREDIT:parity-tests;
 #MUSIC:;
 #OFFSET:0.000;
 #SAMPLESTART:0.000;

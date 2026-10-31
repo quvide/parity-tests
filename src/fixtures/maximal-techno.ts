@@ -1,7 +1,7 @@
 import type { FixtureDef } from "../dsl"
 
+// MAXIMAL TECHNO stepjumps
 export default {
-  description: "MAXIMAL TECHNO stepjumps",
   bpm: [144],
   subdivision: 8,
   pattern: `
@@ -13,50 +13,50 @@ export default {
     .R..
 
     // 1st phrase: 
-    .rL. | JA JU
+    .rL. | SJ
     ....
-    L_.. | DS SJ
+    L_.. | DS
     ...R
 
     // 2nd
-    ..lR | JA JU
+    ..lR | SJ
     ....
-    .R_. | DS SJ
+    .R_.
     L...
 
     // 3rd
-    L.r. | JA JU
+    L.r. | SJ
     ....
-    .L_. | DS SJ
+    .L_.
     ...R
 
     // 4th
-    .l.R | JA JU
+    .l.R | SJ
     ....
-    ._R. | DS SJ
+    ._R. | DS
     L...
 
     // 5th (no hold)
-    LR.. | JA JU
-    .R.. | SJ
+    LR.. | SJ
+    .R..
     L...
     ...R
 
     // 6th
-    .l.R | JA JU
+    .l.R | SJ
     ....
-    ._R. | DS SJ
+    ._R.
     L...
 
     // 7th
-    Lr.. | JA JU
+    Lr.. | SJ
     ....
-    ._L. | DS SJ
+    ._L.
     ...R
 
     // 8th (no hold)
-    ..LR | JA JU
-    ..L. | SJ
+    ..LR | SJ
+    ..L. | JA
     .R..
     L...
   `,

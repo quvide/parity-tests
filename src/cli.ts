@@ -2,7 +2,7 @@ import * as fs from "node:fs"
 import * as path from "node:path"
 import { fileURLToPath } from "node:url"
 import { parseArgs } from "node:util"
-import { expandBpms, parseFixture, FixtureNote, ParsedFixture } from "./dsl"
+import { expandBpms, fixtureReadings, parseFixture, FixtureNote, ParsedFixture } from "./dsl"
 import { FIXTURES } from "./fixtures/index"
 import { availableParallelism } from "node:os"
 import {
@@ -551,6 +551,50 @@ function forceExpectedFeet(parsed: ParsedFixture): FixtureNote[] | undefined {
   return count === 0 ? undefined : overridden
 }
 
+function fmtGap(g: number): string {
+  return `${g >= 0 ? "+" : ""}${g.toFixed(1)}`
+}
+
+// Status-line tag for a fixture with alternative readings: which reading the
+// engine chose (per tempo when tempos disagree) and each other reading's
+// forced-path cost over that choice, red where it exceeds the margin.
+function readingTag(
+  results: {
+    bpm: number
+    reading: string
+    preferred: string
+    gaps: { name: string; gap: number }[]
+  }[],
+  margin?: number
+): string {
+  if (results.every(r => r.gaps.length === 0)) return ""
+  // the engine chose a legal reading, but not the preferred one at some tempo
+  const notPreferred = results.some(r => r.reading !== "none" && r.reading !== r.preferred)
+  const preferredNote = notPreferred ? `${YELLOW}preferred ${results[0].preferred}; ${RESET}${DIM}` : ""
+  const byReading = new Map<string, number[]>()
+  for (const r of results)
+    byReading.set(r.reading, [...(byReading.get(r.reading) ?? []), r.bpm])
+  const winners = [...byReading.entries()]
+    .map(([name, bpms]) =>
+      byReading.size > 1 ? `${name}@${bpms.sort((a, b) => a - b).join(",")}` : name
+    )
+    .join(" ")
+  const names = [...new Set(results.flatMap(r => r.gaps.map(g => g.name)))]
+  const gapText = names
+    .map(name => {
+      const gs = results.flatMap(r =>
+        r.gaps.filter(g => g.name === name).map(g => g.gap)
+      )
+      const lo = Math.min(...gs)
+      const hi = Math.max(...gs)
+      const text = `${name} ${lo === hi ? fmtGap(lo) : `${fmtGap(lo)}…${fmtGap(hi)}`}`
+      return margin !== undefined && hi > margin ? `${RED}${text}${RESET}` : text
+    })
+    .join(", ")
+  const band = margin !== undefined ? `; margin ${margin}` : ""
+  return `  → ${winners}  ${DIM}(${preferredNote}${gapText}${band})${RESET}`
+}
+
 // Force a fixture's expected feet as parity overrides, so the comparison
 // explains WHY the engine deviates from the fixture's ground truth.
 function explainFixture(parsed: ParsedFixture) {
@@ -759,9 +803,41 @@ function runFixtures(): number {
         mirroredTotal: 0,
       }
       const results = variants.map(variant => {
-        const parsed = parseFixture(variant)
-        const run = runEngine(parsed.notedata, parsed.lastBeat)
-        const report = evaluateFixture(parsed, run)
+        const readings = fixtureReadings(variant).map(r => ({
+          name: r.name,
+          parsed: parseFixture({ ...variant, pattern: r.pattern }),
+        }))
+        const run = runEngine(readings[0].parsed.notedata, readings[0].parsed.lastBeat)
+        const scored = readings.map(r => ({ ...r, report: evaluateFixture(r.parsed, run) }))
+        // the reading the engine came closest to: feet first, then notation;
+        // the preferred reading on a tie
+        const best = scored.reduce((a, b) =>
+          b.report.footProblems < a.report.footProblems ||
+          (b.report.footProblems === a.report.footProblems &&
+            b.report.problems < a.report.problems)
+            ? b
+            : a
+        )
+        const parsed = best.parsed
+        const report = best.report
+        const matched = best.report.footProblems === 0
+        // every other reading forced through the engine: its cost over the
+        // engine's own choice (every reading, when the engine matched none)
+        const gaps = scored
+          .filter(r => scored.length > 1 && (!matched || r !== best))
+          .map(r => {
+            const forced = forceExpectedFeet(r.parsed)
+            if (!forced) return { name: r.name, gap: 0 }
+            const cmp = compareAnnotated(forced, r.parsed.lastBeat)
+            return {
+              name: r.name,
+              gap: cmp.annotated.bestPathCost - cmp.natural.bestPathCost,
+            }
+          })
+        const overMargin =
+          variant.margin === undefined
+            ? []
+            : gaps.filter(g => g.gap > variant.margin!)
         // engine run with the expected feet forced, for the tech:ann column;
         // only computed when the per-row table can print (-v, or --explain
         // on a failing fixture — default mode prints no tables)
@@ -781,10 +857,14 @@ function runFixtures(): number {
           run,
           annRun,
           report,
+          reading: matched ? best.name : "none",
+          preferred: readings[0].name,
+          gaps,
+          overMargin,
           mirror,
           udMirror,
           lrudMirror,
-          pass: report.problems === 0,
+          pass: report.problems === 0 && overMargin.length === 0,
           symmetric: mirror.ok && udMirror.ok && lrudMirror.ok,
         }
       })
@@ -793,7 +873,9 @@ function runFixtures(): number {
       const symmetric = results.every(r => r.symmetric)
       // feet fully correct but something secondary is off — tech-notation
       // expectations or a mirror invariant — reported as PARTIAL
-      const notationOnly = !pass && results.every(r => r.report.footProblems === 0)
+      const notationOnly =
+        !pass &&
+        results.every(r => r.report.footProblems === 0 && r.overMargin.length === 0)
       const partial = notationOnly || (pass && !symmetric)
       const failedBpms = results
         .filter(r => !r.pass)
@@ -839,7 +921,7 @@ function runFixtures(): number {
       } else {
         status = `${RED}FAIL${RESET}`
       }
-      line = `${status}  ${fixture.name}${bpmTag}${mirrorTag}`
+      line = `${status}  ${fixture.name}${bpmTag}${mirrorTag}${readingTag(results, fixture.margin)}`
       console.log(line)
       if (known && pass && symmetric) {
         console.log(
@@ -880,6 +962,11 @@ function runFixtures(): number {
         if (multi) console.log(`   ${DIM}@${r.bpm}:${RESET}`)
         if (r.report.error) {
           console.log(`   ${RED}${r.report.error}${RESET}`)
+        }
+        for (const g of r.gaps) {
+          console.log(
+            `   ${DIM}reading ${g.name}: forced path ${fmtGap(g.gap)} over the engine's choice${r.reading === "none" ? "" : ` (${r.reading})`}${RESET}`
+          )
         }
         if (!r.pass || verbose) {
           console.log(

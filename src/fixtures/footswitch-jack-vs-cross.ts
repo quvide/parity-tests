@@ -2,8 +2,8 @@ import type { FixtureVariantDef } from "../dsl"
 
 export default [
   {
+    // fast reading: footswitch into crossover
     variant: "fs-xo",
-    description: "fast reading: footswitch into crossover",
     bpm: [175, 220],
     subdivision: 16,
     pattern: `
@@ -16,7 +16,7 @@ export default [
       .R..
       ..L.
       .R..
-      ...L // engine doesn't treat this as XO as L hasn't gone to left
+      ...L  // TODO: engine doesn't treat this as XO as L hasn't gone to left
       .R..
       ..L.
       .R..
@@ -24,10 +24,10 @@ export default [
       ...R
     `,
   },
-  // TODO: this should probably not be read as XO
+
   {
+    // slow reading: jack, no crossover
     variant: "jack",
-    description: "slow reading: jack, no crossover",
     bpm: [120, 170],
     subdivision: 16,
     pattern: `

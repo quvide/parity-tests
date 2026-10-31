@@ -1,6 +1,6 @@
 import { readdirSync } from "node:fs"
 import { fileURLToPath } from "node:url"
-import { arrowSkeleton, Fixture, FixtureDef, FixtureVariantDef } from "../dsl"
+import { arrowSkeleton, Fixture, FixtureCasesDef, FixtureDef, FixtureVariantDef, preferredPattern } from "../dsl"
 
 // Each fixture lives in its own file here, default-exporting a FixtureDef —
 // or a FixtureVariantDef[] when one arrow pattern has several annotated
@@ -17,9 +17,25 @@ export const FIXTURES: Fixture[] = (
   await Promise.all(
     files.map(async (file): Promise<Fixture[]> => {
       const mod = await import(new URL(file, import.meta.url).href)
-      const def: FixtureDef | FixtureVariantDef[] | undefined = mod.default
+      let def: FixtureDef | FixtureVariantDef[] | FixtureCasesDef | undefined = mod.default
       const base = file.replace(/\.ts$/, "")
+      if (def && !Array.isArray(def) && "cases" in def) {
+        const group = def as FixtureCasesDef
+        const seen = new Set<string>()
+        return group.cases.map(c => {
+          const bpm = c.bpm ?? group.bpm
+          const subdivision = c.subdivision ?? group.subdivision
+          if (!c.case || bpm === undefined || subdivision === undefined || (typeof c.pattern !== "string" && !Object.keys(c.patterns ?? {}).length)) {
+            throw new Error(`fixtures/${file}: each case needs a case name, a pattern, and a bpm and subdivision (own or shared)`)
+          }
+          if (seen.has(c.case)) throw new Error(`fixtures/${file}: duplicate case "${c.case}"`)
+          seen.add(c.case)
+          const { case: name, ...rest } = c
+          return { name: `${base}.${name}`, ...rest, bpm, subdivision }
+        })
+      }
       if (Array.isArray(def)) {
+        def = def as FixtureVariantDef[]
         const seen = new Set<string>()
         const fixtures = def.map(v => {
           if (typeof v.pattern !== "string" || !v.variant) {
@@ -50,8 +66,20 @@ export const FIXTURES: Fixture[] = (
         }
         return fixtures
       }
-      if (!def || typeof def.pattern !== "string") {
+      if (!def || (typeof def.pattern !== "string" && !Object.keys(def.patterns ?? {}).length)) {
         throw new Error(`fixtures/${file}: default export is not a FixtureDef`)
+      }
+      // Alternative readings share the preferred pattern's arrows.
+      const ref = arrowSkeleton(preferredPattern(def))
+      for (const [name, pattern] of Object.entries(def.patterns ?? {})) {
+        const skel = arrowSkeleton(pattern)
+        for (let line = 0; line < Math.max(skel.length, ref.length); line++) {
+          if (skel[line] === ref[line]) continue
+          throw new Error(
+            `fixtures/${file}: reading "${name}" arrows differ from pattern at line ${line}: ` +
+              `"${skel[line] ?? "<missing>"}" vs "${ref[line] ?? "<missing>"}"`
+          )
+        }
       }
       return [{ name: base, ...def }]
     })
